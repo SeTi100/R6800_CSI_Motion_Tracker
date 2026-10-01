@@ -1,0 +1,15 @@
+--- a/mt7615/pci_init.c
++++ b/mt7615/pci_init.c
+@@ -120,6 +120,12 @@ void mt7615_unregister_device(struct mt7615_dev *dev)
+ 	if (mcu_running)
+ 		mt7615_mcu_exit(dev);
+ 
++	/* Teardown Memory Leak Fix */
++	if (dev->mt76.csi_buf) {
++		mt76_csi_buf_free(dev->mt76.csi_buf);
++		dev->mt76.csi_buf = NULL;
++	}
++
+ 	mt7615_tx_token_put(dev);
+ 	mt7615_dma_cleanup(dev);
+ 	tasklet_disable(&dev->mt76.irq_tasklet);

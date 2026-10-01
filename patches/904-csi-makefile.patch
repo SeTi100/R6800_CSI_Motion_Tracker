@@ -1,0 +1,22 @@
+--- a/Makefile
++++ b/Makefile
+@@ -11,7 +11,7 @@
+ 
+ mt76-y := \
+ 	mmio.o util.o trace.o dma.o mac80211.o debugfs.o eeprom.o \
+-	tx.o agg-rx.o mcu.o wed.o scan.o channel.o
++	tx.o agg-rx.o mcu.o wed.o scan.o channel.o mt76_csi.o
+ 
+ mt76-$(CONFIG_MT76_NPU) += npu.o
+ mt76-$(CONFIG_PCI) += pci.o
+--- a/mt7615/Makefile
++++ b/mt7615/Makefile
+@@ -10,7 +10,7 @@
+ CFLAGS_trace.o := -I$(src)
+ 
+ mt7615-common-y := main.o init.o mcu.o eeprom.o mac.o \
+-		   debugfs.o trace.o
++		   debugfs.o trace.o mt7615_csi_debugfs.o
+ mt7615-common-$(CONFIG_NL80211_TESTMODE) += testmode.o
+ 
+ mt7615e-y := pci.o pci_init.o dma.o pci_mac.o mmio.o

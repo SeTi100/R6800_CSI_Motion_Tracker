@@ -1,0 +1,35 @@
+--- a/mt76.h
++++ b/mt76.h
+@@ -21,6 +21,7 @@
+ #include <linux/soc/mediatek/mtk_wed.h>
+ #include <net/netlink.h>
+ #include <net/mac80211.h>
++#include "mt76_csi.h"
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6,6,0)
+ #include <net/page_pool.h>
+ #else
+@@ -1041,6 +1042,9 @@
+ 	} test_mtd;
+ #endif
+ 	struct workqueue_struct *wq;
++
++	/* CSI Ring buffer and control state */
++	struct mt76_csi_buf *csi_buf;
+ 
+ 	union {
+ 		struct mt76_mmio mmio;
+--- a/mt7615/mt7615.h
++++ b/mt7615/mt7615.h
+@@ -525,6 +525,12 @@
+ int mt7615_mcu_set_roc(struct mt7615_phy *phy, struct ieee80211_vif *vif,
+ 		       struct ieee80211_channel *chan, int duration);
+ 
++/* CSI Handlers */
++struct dentry;
++void mt7615_csi_debugfs_register(struct mt7615_dev *dev, struct dentry *dir);
++int mt7615_mcu_set_csi(struct mt7615_dev *dev, bool enable);
++void mt7615_mcu_rx_csi(struct mt7615_dev *dev, struct sk_buff *skb);
++
+ int mt7615_init_debugfs(struct mt7615_dev *dev);
+ int mt7615_mcu_wait_response(struct mt7615_dev *dev, int cmd, int seq);
+ 

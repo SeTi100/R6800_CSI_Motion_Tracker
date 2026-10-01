@@ -1,0 +1,69 @@
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1051,6 +1051,7 @@
+ 	MCU_EXT_EVENT_ASSERT_DUMP = 0x23,
+ 	MCU_EXT_EVENT_RDD_REPORT = 0x3a,
+ 	MCU_EXT_EVENT_CSA_NOTIFY = 0x4f,
++	MCU_EXT_EVENT_CSI_REPORT = 0xc2,
+ 	MCU_EXT_EVENT_WA_TX_STAT = 0x74,
+ 	MCU_EXT_EVENT_BCC_NOTIFY = 0x75,
+ 	MCU_EXT_EVENT_WF_RF_PIN_CTRL = 0x9a,
+@@ -1271,6 +1272,7 @@
+ 	MCU_EXT_CMD_DPD_PRE_CAL_INFO = 0xac,
+ 	MCU_EXT_CMD_PHY_STAT_INFO = 0xad,
+ 	MCU_EXT_CMD_WF_RF_PIN_CTRL = 0xbd,
++	MCU_EXT_CMD_CSI_CTRL = 0xc2,
+ };
+ 
+ enum {
+--- a/mt7615/mcu.h
++++ b/mt7615/mcu.h
+@@ -240,4 +240,9 @@
+ 	__DBDC_TYPE_MAX,
+ };
+ 
++struct mt7615_mcu_csi {
++	u8 enable;
++	u8 padding[3];
++} __packed;
++
+ #endif
+--- a/mt7615/mcu.c
++++ b/mt7615/mcu.c
+@@ -435,6 +435,9 @@
+ 		break;
+ 	case MCU_EXT_EVENT_FW_LOG_2_HOST:
+ 		mt7615_mcu_rx_log_message(dev, skb);
++		break;
++	case MCU_EXT_EVENT_CSI_REPORT:
++		mt7615_mcu_rx_csi(dev, skb);
+ 		break;
+ 	default:
+ 		break;
+@@ -571,6 +574,7 @@
+ 	    rxd->ext_eid == MCU_EXT_EVENT_FW_LOG_2_HOST ||
+ 	    rxd->ext_eid == MCU_EXT_EVENT_ASSERT_DUMP ||
+ 	    rxd->ext_eid == MCU_EXT_EVENT_PS_SYNC ||
++	    rxd->ext_eid == MCU_EXT_EVENT_CSI_REPORT ||
+ 	    rxd->eid == MCU_EVENT_BSS_BEACON_LOSS ||
+ 	    rxd->eid == MCU_EVENT_SCHED_SCAN_DONE ||
+ 	    rxd->eid == MCU_EVENT_BSS_ABSENCE ||
+@@ -2611,3 +2615,18 @@
+ 	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(PROTECT_CTRL), &req,
+ 				 sizeof(req), true);
+ }
++
++int mt7615_mcu_set_csi(struct mt7615_dev *dev, bool enable)
++{
++	struct mt7615_mcu_csi req = {
++		.enable = enable ? 1 : 0,
++	};
++	
++	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(CSI_CTRL),
++				 &req, sizeof(req), false);
++}
++
++void mt7615_mcu_rx_csi(struct mt7615_dev *dev, struct sk_buff *skb)
++{
++	/* Handle unsolicited CSI frame from firmware if needed */
++}

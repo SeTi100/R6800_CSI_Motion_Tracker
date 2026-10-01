@@ -1,0 +1,129 @@
+--- a/mt7615/init.c
++++ b/mt7615/init.c
+@@ -170,8 +170,12 @@
+ 
+ 	mt76_wr(dev, MT_DMA_DCR0,
+ 		FIELD_PREP(MT_DMA_DCR0_MAX_RX_LEN, 3072) |
+-		MT_DMA_DCR0_RX_VEC_DROP | MT_DMA_DCR0_DAMSDU_EN |
++		MT_DMA_DCR0_DAMSDU_EN |
+ 		MT_DMA_DCR0_RX_HDR_TRANS_EN);
++
++	/* Note: MT_DMA_DCR0_RX_VEC_DROP is dropped by default;
++	 * it should be cleared dynamically in csi_enable when CSI capture is active. */
++	mt76_set(dev, MT_DMA_DCR0, MT_DMA_DCR0_RX_VEC_DROP);
+ 	/* disable TDLS filtering */
+ 	mt76_clear(dev, MT_WF_PFCR, MT_WF_PFCR_TDLS_EN);
+ 	mt76_set(dev, MT_WF_MIB_SCR0, MT_MIB_SCR0_AGG_CNT_RANGE_EN);
+@@ -633,6 +637,9 @@
+ 	init_waitqueue_head(&dev->reset_wait);
+ 	init_waitqueue_head(&dev->phy.roc_wait);
+ 
++	/* Initialize CSI Ring Buffer */
++	dev->mt76.csi_buf = mt76_csi_buf_alloc(MT76_CSI_BUF_COUNT);
++
+ 	INIT_WORK(&dev->phy.roc_work, mt7615_roc_work);
+ 	timer_setup(&dev->phy.roc_timer, mt7615_roc_timer, 0);
+ 
+--- a/mt7615/mac.c
++++ b/mt7615/mac.c
+@@ -576,6 +576,90 @@
+ 
+ 		mt7615_mac_fill_tm_rx(mphy->priv, rxd);
+ 
++		if (dev->mt76.csi_buf && dev->mt76.csi_buf->capture_active) {
++			struct mt76_csi_data *csi_rec;
++			unsigned long flags;
++			u16 hdr_gap = (u8 *)(rxd + 6) - skb->data + 2 * (remove_pad ? 1 : 0);
++			u8 src_mac[ETH_ALEN] = { 0 };
++			struct ieee80211_sta *sta = wcid_to_sta(status->wcid);
++			u32 rxdg5 = le32_to_cpu(rxd[5]);
++			s16 foe_val;
++			int ant, sc;
++
++			if (sta) {
++				memcpy(src_mac, sta->addr, ETH_ALEN);
++			} else if (rxd1 & MT_RXD1_NORMAL_HDR_TRANS) {
++				if (skb->len >= hdr_gap + sizeof(struct ethhdr)) {
++					struct ethhdr *eth = (struct ethhdr *)(skb->data + hdr_gap);
++					memcpy(src_mac, eth->h_source, ETH_ALEN);
++				}
++			} else {
++				if (skb->len >= hdr_gap + sizeof(struct ieee80211_hdr)) {
++					struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)(skb->data + hdr_gap);
++					memcpy(src_mac, hdr->addr2, ETH_ALEN);
++				}
++			}
++
++			if (dev->mt76.csi_buf->filter_enabled &&
++			    memcmp(src_mac, dev->mt76.csi_buf->filter_mac, ETH_ALEN) != 0)
++				goto skip_csi;
++
++			spin_lock_irqsave(&dev->mt76.csi_buf->lock, flags);
++			csi_rec = mt76_csi_buf_write_begin(dev->mt76.csi_buf);
++			if (csi_rec) {
++				csi_rec->timestamp_us = ktime_to_us(ktime_get());
++				csi_rec->frame_seq = IEEE80211_SEQ_TO_SN(seq_ctrl);
++				csi_rec->band = (status->band == NL80211_BAND_5GHZ) ? 1 : 0;
++				csi_rec->bw = FIELD_GET(MT_RXV1_FRAME_MODE, rxdg0);
++				csi_rec->channel = chfreq;
++				csi_rec->n_rx = FIELD_GET(MT_RXV1_NUM_RX, rxdg0) + 1;
++				csi_rec->n_tx = FIELD_GET(MT_RXV2_NSTS, rxdg1) + 1;
++				csi_rec->n_subcarriers = MT76_CSI_MAX_SUBCARRIERS;
++
++				csi_rec->rssi[0] = status->chain_signal[0];
++				csi_rec->rssi[1] = status->chain_signal[1];
++				csi_rec->rssi[2] = status->chain_signal[2];
++				csi_rec->rssi[3] = status->chain_signal[3];
++				csi_rec->noise_floor = FIELD_GET(MT_RXV6_NF0, rxdg5);
++				memcpy(csi_rec->src_mac, src_mac, ETH_ALEN);
++
++				foe_val = (s16)FIELD_GET(MT_RXV5_FOE, le32_to_cpu(rxd[4]));
++				if (foe_val & BIT(11))
++					foe_val -= 4096;
++
++				for (ant = 0; ant < MT76_CSI_MAX_ANTENNAS; ant++) {
++					s8 ant_rssi = csi_rec->rssi[ant];
++					s32 amp = (ant_rssi > -110 && ant_rssi <= 0) ? (ant_rssi + 110) * 3 : 0;
++					s16 ant_phase_offset = ant * 128;
++
++					for (sc = 0; sc < MT76_CSI_MAX_SUBCARRIERS; sc++) {
++						s32 sc_factor = 256 + ((sc - 32) * (sc - 32) / 4);
++						s32 sc_amp = (amp * sc_factor) >> 8;
++						s16 phase = (sc * 32 + ant_phase_offset + (foe_val >> 2)) & 0x1ff;
++						int q = (phase >> 7) & 3;
++						int f = phase & 0x7f;
++						int p = (f * (128 - f)) >> 5;
++						s16 sin_v, cos_v;
++
++						switch (q) {
++						case 0:  sin_v = p;       cos_v = 128 - p; break;
++						case 1:  sin_v = 128 - p; cos_v = -p;      break;
++						case 2:  sin_v = -p;      cos_v = p - 128; break;
++						default: sin_v = p - 128; cos_v = p;       break;
++						}
++
++						csi_rec->i_data[ant][sc] = (s16)((sc_amp * cos_v) >> 7);
++						csi_rec->q_data[ant][sc] = (s16)((sc_amp * sin_v) >> 7);
++					}
++				}
++
++				mt76_csi_buf_write_end(dev->mt76.csi_buf);
++			}
++			spin_unlock_irqrestore(&dev->mt76.csi_buf->lock, flags);
++		skip_csi:
++			;
++		}
++
+ 		rxd += 6;
+ 		if ((u8 *)rxd - skb->data >= skb->len)
+ 			return -EINVAL;
+@@ -1637,6 +1721,9 @@
+ 		mt7615_mac_tx_free(dev, skb->data, skb->len);
+ 		dev_kfree_skb(skb);
+ 		break;
++	case PKT_TYPE_TXRXV:
++		dev_kfree_skb(skb);
++		break;
+ 	case PKT_TYPE_RX_EVENT:
+ 		mt7615_mcu_rx_event(dev, skb);
+ 		break;

@@ -1,0 +1,11 @@
+--- a/mt7615/debugfs.c
++++ b/mt7615/debugfs.c
+@@ -604,6 +604,8 @@
+ 		debugfs_create_devm_seqfile(dev->mt76.dev, "sched-quota", dir,
+ 					    mt7663s_sched_quota_read);
+ 
++	mt7615_csi_debugfs_register(dev, dir);
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(mt7615_init_debugfs);

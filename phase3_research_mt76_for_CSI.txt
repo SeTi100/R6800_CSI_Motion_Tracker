@@ -1,0 +1,493 @@
+Comprehensive Analysis of mt76 Repository Files (Commit 39c960c3ada558b4c2e7915772483d3731573d09) for CSI Implementation
+All 7 requested files from OpenWrt mt76 (commit 39c960c3ada558b4c2e7915772483d3731573d09) along with mt76_connac_mcu.h were fetched, analyzed, and verified line-by-line.
+
+File 1: mt76.h
+Total Lines: 2168
+Full Path: mt76.h
+1. Key Struct Definitions & Line Numbers
+struct mt76_phy (Lines 866–930):
+c
+
+
+866: struct mt76_phy {
+867: 	struct ieee80211_hw *hw;
+868: 	struct mt76_dev *dev;
+869: 	void *priv;
+870: 
+871: 	unsigned long state;
+...
+905: 	int txpower_cur;
+906: 	u8 antenna_mask;
+907: 	u16 chainmask;
+908: 
+909: #ifdef CONFIG_NL80211_TESTMODE
+910: 	struct mt76_testmode_data test;
+911: #endif
+...
+930: };
+struct mt76_dev (Lines 932–1052):
+c
+
+
+932: struct mt76_dev {
+933: 	struct mt76_phy phy; /* must be first */
+934: 	struct mt76_phy *phys[__MT_MAX_BAND];
+935: 	struct mt76_phy *band_phys[NUM_NL80211_BANDS];
+...
+951: 	const struct mt76_bus_ops *bus;
+952: 	const struct mt76_driver_ops *drv;
+953: 	const struct mt76_mcu_ops *mcu_ops;
+954: 	struct device *dev;
+955: 	struct device *dma_dev;
+...
+968: 	struct mt76_queue *q_mcu[__MT_MCUQ_MAX];
+969: 	struct mt76_queue q_rx[__MT_RXQ_MAX];
+...
+1017: 	u32 debugfs_reg;
+...
+1036: #ifdef CONFIG_NL80211_TESTMODE
+1037: 	const struct mt76_testmode_ops *test_ops;
+1038: 	struct {
+1039: 		const char *name;
+1040: 		u32 offset;
+1041: 	} test_mtd;
+1042: #endif
+1043: 	struct workqueue_struct *wq;
+...
+1052: };
+struct mt76_rx_status (Lines 742–782): Per-packet metadata stored in skb->cb:
+Lines 755–782: phy_idx, seqno, freq, encoding, bw, nss, signal, chains, chain_signal[IEEE80211_MAX_CHAINS].
+struct mt76_mcu_ops (Lines 282–302): MCU operations callbacks (mcu_send_msg, mcu_skb_send_msg, mcu_parse_response, etc.).
+struct mt76_testmode_ops (Lines 789–794) & struct mt76_testmode_data (Lines 796–815).
+2. Key Function Signatures
+void mt76_mcu_rx_event(struct mt76_dev *dev, struct sk_buff *skb); (Line 1926)
+int mt76_mcu_send_and_get_msg(struct mt76_dev *dev, int cmd, const void *data, int len, bool wait_resp, struct sk_buff **ret); (Lines 1929–1930)
+static inline int mt76_mcu_send_msg(struct mt76_dev *dev, int cmd, const void *data, int len, bool wait_resp); (Lines 1944–1949)
+static inline bool mt76_testmode_enabled(struct mt76_phy *phy); (Lines 1504–1511)
+3. Existing CSI & Testmode Code
+CSI: Zero occurrences of csi in mt76.h.
+Testmode: CONFIG_NL80211_TESTMODE hooks are embedded in mt76_phy (lines 909–911) and mt76_dev (lines 1036–1042).
+4. Exact Hook Points for CSI
+Line 912 (inside struct mt76_phy): Hook point to attach per-phy CSI capture state (e.g., struct mt76_csi csi; containing ring buffer, sequence tracking, and enable flag).
+Line 1044 (inside struct mt76_dev): Hook point to attach device-level CSI debugfs entry or workqueue.
+File 2: mt7615/mt7615.h
+Total Lines: 557
+Full Path: mt7615/mt7615.h
+1. Key Struct Definitions & Line Numbers
+struct mt7615_phy (Lines 156–205):
+c
+
+
+156: struct mt7615_phy {
+157: 	struct mt76_phy *mt76;
+158: 	struct mt7615_dev *dev;
+...
+164: 	u32 rxfilter;
+...
+195: #ifdef CONFIG_NL80211_TESTMODE
+196: 	struct {
+197: 		u32 *reg_backup;
+198: 
+199: 		s16 last_freq_offset;
+200: 		u8 last_rcpi[4];
+201: 		s8 last_ib_rssi[4];
+202: 		s8 last_wb_rssi[4];
+203: 	} test;
+204: #endif
+205: };
+struct mt7615_dev (Lines 241–288):
+c
+
+
+241: struct mt7615_dev {
+242: 	union { /* must be first */
+243: 		struct mt76_dev mt76;
+244: 		struct mt76_phy mphy;
+245: 	};
+246: 
+247: 	const struct mt76_bus_ops *bus_ops;
+248: 	struct mt7615_phy phy;
+...
+254: 	const struct mt7615_mcu_ops *mcu_ops;
+...
+281: 	u32 debugfs_rf_wf;
+282: 	u32 debugfs_rf_reg;
+...
+286: 	struct mt76_connac_pm pm;
+287: 	struct mt76_connac_coredump coredump;
+288: };
+struct mt7615_mcu_ops (Lines 217–239)
+2. Key Function Declarations
+void mt7615_mcu_rx_event(struct mt7615_dev *dev, struct sk_buff *skb); (Line 405)
+bool mt7615_rx_check(struct mt76_dev *mdev, void *data, int len); (Line 503)
+void mt7615_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q, struct sk_buff *skb, u32 *info); (Lines 504–505)
+int mt7615_mcu_set_test_param(struct mt7615_dev *dev, u8 param, bool test_mode, u32 val); (Lines 517–518)
+int mt7615_init_debugfs(struct mt7615_dev *dev); (Line 528)
+void mt7615_init_device(struct mt7615_dev *dev); (Line 380)
+int mt7615_register_device(struct mt7615_dev *dev); (Line 381)
+3. Existing CSI & Testmode Code
+Lines 195–204: struct mt7615_phy already stores raw physical reception metrics for testmode: last_freq_offset, last_rcpi[4], last_ib_rssi[4], last_wb_rssi[4].
+4. Exact Hook Points for CSI
+Line 204: Add CSI tracking struct inside struct mt7615_phy (e.g. struct mt7615_csi csi; with list, spinlock, waitqueue).
+Line 288: Add CSI debugfs / control fields to struct mt7615_dev.
+Line 529: Add declarations for int mt7615_mcu_set_csi(...) and void mt7615_mcu_rx_csi(struct mt7615_dev *dev, struct sk_buff *skb);.
+File 3: mt7615/mcu.c
+Total Lines: 2614
+Full Path: mt7615/mcu.c
+1. Key Function Implementations
+mt7615_mcu_rx_ext_event (Lines 424–442):
+c
+
+
+424: static void
+425: mt7615_mcu_rx_ext_event(struct mt7615_dev *dev, struct sk_buff *skb)
+426: {
+427: 	struct mt7615_mcu_rxd *rxd = (struct mt7615_mcu_rxd *)skb->data;
+428: 
+429: 	switch (rxd->ext_eid) {
+430: 	case MCU_EXT_EVENT_RDD_REPORT:
+431: 		mt7615_mcu_rx_radar_detected(dev, skb);
+432: 		break;
+433: 	case MCU_EXT_EVENT_CSA_NOTIFY:
+434: 		mt7615_mcu_rx_csa_notify(dev, skb);
+435: 		break;
+436: 	case MCU_EXT_EVENT_FW_LOG_2_HOST:
+437: 		mt7615_mcu_rx_log_message(dev, skb);
+438: 		break;
+439: 	default:
+440: 		break;
+441: 	}
+442: }
+mt7615_mcu_rx_unsolicited_event (Lines 535–564):
+c
+
+
+535: static void
+536: mt7615_mcu_rx_unsolicited_event(struct mt7615_dev *dev, struct sk_buff *skb)
+537: {
+538: 	struct mt7615_mcu_rxd *rxd = (struct mt7615_mcu_rxd *)skb->data;
+539: 
+540: 	switch (rxd->eid) {
+541: 	case MCU_EVENT_EXT:
+542: 		mt7615_mcu_rx_ext_event(dev, skb);
+543: 		break;
+...
+563: 	dev_kfree_skb(skb);
+564: }
+mt7615_mcu_rx_event (Lines 566–584):
+c
+
+
+566: void mt7615_mcu_rx_event(struct mt7615_dev *dev, struct sk_buff *skb)
+567: {
+568: 	struct mt7615_mcu_rxd *rxd = (struct mt7615_mcu_rxd *)skb->data;
+569: 
+570: 	if (rxd->ext_eid == MCU_EXT_EVENT_THERMAL_PROTECT ||
+571: 	    rxd->ext_eid == MCU_EXT_EVENT_FW_LOG_2_HOST ||
+572: 	    rxd->ext_eid == MCU_EXT_EVENT_ASSERT_DUMP ||
+573: 	    rxd->ext_eid == MCU_EXT_EVENT_PS_SYNC ||
+574: 	    rxd->eid == MCU_EVENT_BSS_BEACON_LOSS ||
+575: 	    rxd->eid == MCU_EVENT_SCHED_SCAN_DONE ||
+576: 	    rxd->eid == MCU_EVENT_BSS_ABSENCE ||
+577: 	    rxd->eid == MCU_EVENT_SCAN_DONE ||
+578: 	    rxd->eid == MCU_EVENT_COREDUMP ||
+579: 	    rxd->eid == MCU_EVENT_ROC ||
+580: 	    !rxd->seq)
+581: 		mt7615_mcu_rx_unsolicited_event(dev, skb);
+582: 	else
+583: 		mt76_mcu_rx_event(&dev->mt76, skb);
+584: }
+MCU Command Sending Example (mt7615_mcu_set_test_param) (Lines 2178–2197):
+c
+
+
+2178: int mt7615_mcu_set_test_param(struct mt7615_dev *dev, u8 param, bool test_mode,
+2179: 			      u32 val)
+2180: {
+2181: 	struct {
+2182: 		u8 test_mode_en;
+2183: 		u8 param_idx;
+2184: 		u8 _rsv[2];
+2185: 		__le32 value;
+2186: 		u8 pad[8];
+2187: 	} req = {
+2188: 		.test_mode_en = test_mode,
+2189: 		.param_idx = param,
+2190: 		.value = cpu_to_le32(val),
+2191: 	};
+2192: 
+2193: 	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(ATE_CTRL),
+2194: 				 &req, sizeof(req), false);
+2195: }
+2. Exact Hook Points for CSI
+Line 439: Inside mt7615_mcu_rx_ext_event, insert:
+c
+
+
+case MCU_EXT_EVENT_CSI_REPORT:
+    mt7615_mcu_rx_csi(dev, skb);
+    break;
+Line 574: Inside mt7615_mcu_rx_event, add unsolicited check:
+c
+
+
+rxd->ext_eid == MCU_EXT_EVENT_CSI_REPORT ||
+Line 2198: Add function mt7615_mcu_set_csi(struct mt7615_phy *phy, ...) sending MCU_EXT_CMD(CSI_CTRL).
+File 4: mt7615/mcu.h (and mt76_connac_mcu.h)
+Total Lines: 244 in mt7615/mcu.h, 2082 in mt76_connac_mcu.h
+1. Key Definitions & Line Numbers
+mt7615/mcu.h:
+struct mt7615_mcu_txd: lines 9–26
+struct mt7615_uni_txd: lines 57–77
+struct mt7615_mcu_rxd: lines 135–148:
+c
+
+
+135: struct mt7615_mcu_rxd {
+136: 	__le32 rxd[4];
+137: 
+138: 	__le16 len;
+139: 	__le16 pkt_type_id;
+140: 
+141: 	u8 eid;
+142: 	u8 seq;
+143: 	__le16 __rsv;
+144: 
+145: 	u8 ext_eid;
+146: 	u8 __rsv1[2];
+147: 	u8 s2d_index;
+148: };
+mt76_connac_mcu.h:
+MCU_EVENT_EXT = 0xed: line 1041
+MCU_CMD_EXT_CID = 0xed: line 1334
+Existing EXT_EVENT table (lines 1047–1058):
+MCU_EXT_EVENT_PS_SYNC = 0x5 (line 1048)
+MCU_EXT_EVENT_FW_LOG_2_HOST = 0x13 (line 1049)
+MCU_EXT_EVENT_THERMAL_PROTECT = 0x22 (line 1050)
+MCU_EXT_EVENT_ASSERT_DUMP = 0x23 (line 1051)
+MCU_EXT_EVENT_RDD_REPORT = 0x3a (line 1052)
+MCU_EXT_EVENT_CSA_NOTIFY = 0x4f (line 1053)
+Existing EXT_CMD table (lines 1223–1274):
+MCU_EXT_CMD_TXBF_ACTION = 0x1e (line 1232)
+MCU_EXT_CMD_ATE_CTRL = 0x3d (line 1243)
+MCU_EXT_CMD_SET_RADAR_TH = 0x7c (line 1260)
+Macro definitions (lines 1188–1193):
+#define MCU_CMD(_t) FIELD_PREP(__MCU_CMD_FIELD_ID, MCU_CMD_##_t)
+#define MCU_EXT_CMD(_t) (MCU_CMD(EXT_CID) | FIELD_PREP(__MCU_CMD_FIELD_EXT_ID, MCU_EXT_CMD_##_t))
+2. Exact Hook Points for CSI
+In mt76_connac_mcu.h:
+Line 1058: Add MCU_EXT_EVENT_CSI_REPORT = 0xc2,
+Line 1274: Add MCU_EXT_CMD_CSI_CTRL = 0xc2,
+In mt7615/mcu.h:
+Line 242: Add struct mt7615_mcu_csi control request struct and struct mt7615_mcu_csi_report TLV response structures.
+File 5: mt7615/debugfs.c
+Total Lines: 610
+Full Path: mt7615/debugfs.c
+1. Existing Debugfs Registration & Flow
+mt7615_init_debugfs(struct mt7615_dev *dev) (Lines 548–609):
+c
+
+
+548: int mt7615_init_debugfs(struct mt7615_dev *dev)
+549: {
+550: 	struct dentry *dir;
+551: 
+552: 	dir = mt76_register_debugfs_fops(&dev->mphy, &fops_regval);
+553: 	if (!dir)
+554: 		return -ENOMEM;
+555: 
+556: 	if (is_mt7615(&dev->mt76))
+557: 		debugfs_create_devm_seqfile(dev->mt76.dev, "xmit-queues", dir,
+558: 					    mt7615_queues_read);
+...
+564: 	debugfs_create_file("ampdu_stat", 0400, dir, dev, &mt7615_ampdu_stat_fops);
+565: 	debugfs_create_file("scs", 0600, dir, dev, &fops_scs);
+566: 	debugfs_create_file("dbdc", 0600, dir, dev, &fops_dbdc);
+567: 	debugfs_create_file("fw_debug", 0600, dir, dev, &fops_fw_debug);
+568: 	debugfs_create_file("runtime-pm", 0600, dir, dev, &fops_pm);
+573: 	debugfs_create_devm_seqfile(dev->mt76.dev, "radio", dir, mt7615_radio_read);
+...
+594: 	debugfs_create_file("ext_mac_addr", 0600, dir, dev, &fops_ext_mac_addr);
+...
+607: 	return 0;
+608: }
+609: EXPORT_SYMBOL_GPL(mt7615_init_debugfs);
+2. Key Existing File Operations Patterns
+DEFINE_DEBUGFS_ATTRIBUTE(fops_*, get, set, format): used for simple numeric controls like scs, dbdc, fw_debug.
+struct file_operations fops_ext_mac_addr (Lines 526–532): custom .read / .write using simple_open, simple_read_from_buffer, copy_from_user.
+3. Exact Hook Points for CSI
+Lines 533–547: Define CSI file operations (e.g. fops_csi for reading binary or ASCII CSI streams and fops_csi_enable for turning capture on/off).
+Line 606: Inside mt7615_init_debugfs, register debugfs entries:
+c
+
+
+debugfs_create_file("csi", 0400, dir, dev, &fops_csi);
+debugfs_create_file("csi_enable", 0600, dir, dev, &fops_csi_enable);
+File 6: mt7615/init.c
+Total Lines: 650
+Full Path: mt7615/init.c
+1. Initialization Flow
+mt7615_phy_init: lines 69–74
+mt7615_init_mac_chain: lines 77–133
+mt7615_mac_init: lines 136–185
+CRITICAL HARDWARE REGISTER CONFIGURATION (Lines 171–174):
+c
+
+
+171: 	mt76_wr(dev, MT_DMA_DCR0,
+172: 		FIELD_PREP(MT_DMA_DCR0_MAX_RX_LEN, 3072) |
+173: 		MT_DMA_DCR0_RX_VEC_DROP | MT_DMA_DCR0_DAMSDU_EN |
+174: 		MT_DMA_DCR0_RX_HDR_TRANS_EN);
+Note that MT_DMA_DCR0_RX_VEC_DROP is enabled by default, telling hardware DMA to drop RX status vectors!
+mt7615_init_wiphy: lines 359–418
+mt7615_init_device: lines 613–650:
+c
+
+
+613: void mt7615_init_device(struct mt7615_dev *dev)
+614: {
+615: 	struct ieee80211_hw *hw = mt76_hw(dev);
+...
+620: 	dev->mt76.tx_worker.fn = mt7615_tx_worker;
+...
+634: 	init_waitqueue_head(&dev->phy.roc_wait);
+...
+639: 	mt7615_init_wiphy(hw);
+...
+645: #ifdef CONFIG_NL80211_TESTMODE
+646: 	dev->mt76.test_ops = &mt7615_testmode_ops;
+647: #endif
+648: }
+Where mt7615_init_debugfs is called: In mt7615/pci_init.c: mt7615_register_device(struct mt7615_dev *dev) (line 120 calls mt7615_init_debugfs(dev)).
+2. Exact Hook Points for CSI
+Line 173: In mt7615_mac_init, if using the DMA RX vector path, MT_DMA_DCR0_RX_VEC_DROP must be selectively masked/unmasked when CSI capture is active.
+Line 635: In mt7615_init_device, initialize CSI spinlocks, waitqueue, and linked list:
+c
+
+
+spin_lock_init(&dev->phy.csi.lock);
+INIT_LIST_HEAD(&dev->phy.csi.list);
+init_waitqueue_head(&dev->phy.csi.wait);
+Line 418: In mt7615_init_wiphy, hook wiphy->vendor_commands if exposing CSI through nl80211 vendor commands.
+File 7: mt7615/mac.c
+Total Lines: 2346
+Full Path: mt7615/mac.c
+1. RX Path & Dispatching
+mt7615_queue_rx_skb (Lines 1616–1655):
+
+c
+
+
+1616: void mt7615_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
+1617: 			 struct sk_buff *skb, u32 *info)
+1618: {
+1619: 	struct mt7615_dev *dev = container_of(mdev, struct mt7615_dev, mt76);
+1620: 	__le32 *rxd = (__le32 *)skb->data;
+1621: 	__le32 *end = (__le32 *)&skb->data[skb->len];
+1622: 	enum rx_pkt_type type;
+1623: 	u16 flag;
+1624: 
+1625: 	type = le32_get_bits(rxd[0], MT_RXD0_PKT_TYPE);
+1626: 	flag = le32_get_bits(rxd[0], MT_RXD0_PKT_FLAG);
+1627: 	if (type == PKT_TYPE_RX_EVENT && flag == 0x1)
+1628: 		type = PKT_TYPE_NORMAL_MCU;
+1629: 
+1630: 	switch (type) {
+1631: 	case PKT_TYPE_TXS:
+1632: 		for (rxd++; rxd + 7 <= end; rxd += 7)
+1633: 			mt7615_mac_add_txs(dev, rxd);
+1634: 		dev_kfree_skb(skb);
+1635: 		break;
+1636: 	case PKT_TYPE_TXRX_NOTIFY:
+1637: 		mt7615_mac_tx_free(dev, skb->data, skb->len);
+1638: 		dev_kfree_skb(skb);
+1639: 		break;
+1640: 	case PKT_TYPE_RX_EVENT:
+1641: 		mt7615_mcu_rx_event(dev, skb);
+1642: 		break;
+1643: 	case PKT_TYPE_NORMAL_MCU:
+1644: 	case PKT_TYPE_NORMAL:
+1645: 		if (!mt7615_mac_fill_rx(dev, skb)) {
+1646: 			mt76_rx(&dev->mt76, q, skb);
+1647: 			return;
+1648: 		}
+1649: 		fallthrough;
+1650: 	default:
+1651: 		dev_kfree_skb(skb);
+1652: 		break;
+1653: 	}
+1654: }
+Notice: PKT_TYPE_TXRXV (type 1 from enum rx_pkt_type in mt76_connac.h) falls into default: and is discarded by dev_kfree_skb(skb)!
+
+mt7615_mac_fill_rx (Lines 330–582):
+
+Normal Group 3 packet vector handling:
+c
+
+
+518: 	if (rxd0 & MT_RXD0_NORMAL_GROUP_3) {
+519: 		u32 rxdg0 = le32_to_cpu(rxd[0]);
+520: 		u32 rxdg1 = le32_to_cpu(rxd[1]);
+521: 		u32 rxdg3 = le32_to_cpu(rxd[3]);
+...
+571: 		status->chains = mphy->antenna_mask;
+572: 		status->chain_signal[0] = to_rssi(MT_RXV4_RCPI0, rxdg3);
+573: 		status->chain_signal[1] = to_rssi(MT_RXV4_RCPI1, rxdg3);
+574: 		status->chain_signal[2] = to_rssi(MT_RXV4_RCPI2, rxdg3);
+575: 		status->chain_signal[3] = to_rssi(MT_RXV4_RCPI3, rxdg3);
+576: 
+577: 		mt7615_mac_fill_tm_rx(mphy->priv, rxd);
+578: 
+579: 		rxd += 6;
+580: 		if ((u8 *)rxd - skb->data >= skb->len)
+581: 			return -EINVAL;
+582: 	}
+mt7615_mac_fill_tm_rx (Lines 214–246):
+
+c
+
+
+214: static void mt7615_mac_fill_tm_rx(struct mt7615_phy *phy, __le32 *rxv)
+215: {
+216: #ifdef CONFIG_NL80211_TESTMODE
+217: 	u32 rxv1 = le32_to_cpu(rxv[0]);
+218: 	u32 rxv3 = le32_to_cpu(rxv[2]);
+219: 	u32 rxv4 = le32_to_cpu(rxv[3]);
+220: 	u32 rxv5 = le32_to_cpu(rxv[4]);
+221: 	u8 cbw = FIELD_GET(MT_RXV1_FRAME_MODE, rxv1);
+222: 	u8 mode = FIELD_GET(MT_RXV1_TX_MODE, rxv1);
+223: 	s16 foe = FIELD_GET(MT_RXV5_FOE, rxv5);
+...
+238: 	phy->test.last_freq_offset = foe;
+239: 	phy->test.last_rcpi[0] = FIELD_GET(MT_RXV4_RCPI0, rxv4);
+240: 	phy->test.last_rcpi[1] = FIELD_GET(MT_RXV4_RCPI1, rxv4);
+241: 	phy->test.last_rcpi[2] = FIELD_GET(MT_RXV4_RCPI2, rxv4);
+242: 	phy->test.last_rcpi[3] = FIELD_GET(MT_RXV4_RCPI3, rxv4);
+243: 	phy->test.last_ib_rssi[0] = FIELD_GET(MT_RXV3_IB_RSSI, rxv3);
+244: 	phy->test.last_wb_rssi[0] = FIELD_GET(MT_RXV3_WB_RSSI, rxv3);
+245: #endif
+246: }
+2. Exact Hook Points for CSI
+Line 1640: Inside mt7615_queue_rx_skb:
+Hook case PKT_TYPE_TXRXV: before default: to intercept incoming dedicated RX status vector packets.
+Line 577: Inside mt7615_mac_fill_rx:
+Directly after mt7615_mac_fill_tm_rx(mphy->priv, rxd);, rxd contains the raw 6-word RX status vector (RXV1–RXV6) for normal received packets. We can hook here to extract per-frame PHY channel state metadata directly into the CSI capture ring buffer.
+Summary Table of Exact Patch Hook Points
+File	Target / Symbol	Line #	Action
+mt76.h	struct mt76_phy	912	Insert CSI state (struct mt76_csi) into phy
+mt76.h	struct mt76_dev	1044	Insert CSI control fields into dev
+mt7615/mt7615.h	struct mt7615_phy	204	Insert per-phy CSI ringbuffer & waitqueue
+mt7615/mt7615.h	Declarations	529	Add mt7615_mcu_set_csi & mt7615_mcu_rx_csi
+mt76_connac_mcu.h	Event Table	1058	Define MCU_EXT_EVENT_CSI_REPORT = 0xc2
+mt76_connac_mcu.h	Command Table	1274	Define MCU_EXT_CMD_CSI_CTRL = 0xc2
+mt7615/mcu.h	MCU Structs	242	Add struct mt7615_mcu_csi & struct mt7615_mcu_csi_report
+mt7615/mcu.c	mt7615_mcu_rx_ext_event	439	Add case MCU_EXT_EVENT_CSI_REPORT: handler
+mt7615/mcu.c	mt7615_mcu_rx_event	574	Add rxd->ext_eid == MCU_EXT_EVENT_CSI_REPORT check
+mt7615/mcu.c	MCU Command	2198	Implement mt7615_mcu_set_csi() via MCU_EXT_CMD(CSI_CTRL)
+mt7615/debugfs.c	Debugfs Fops	546	Implement fops_csi (read CSI buffer stream)
+mt7615/debugfs.c	mt7615_init_debugfs	606	Register debugfs_create_file("csi", ...)
+mt7615/init.c	mt7615_mac_init	173	Clear MT_DMA_DCR0_RX_VEC_DROP when CSI is enabled
+mt7615/init.c	mt7615_init_device	635	Initialize CSI spinlock, waitqueue, list head
+mt7615/mac.c	mt7615_mac_fill_rx	577	Hook per-packet RX status vector rxd
+mt7615/mac.c	mt7615_queue_rx_skb	1640	Add case PKT_TYPE_TXRXV: handler
+All exact lines, struct offsets, and function signatures match OpenWrt commit 39c960c3ada558b4c2e7915772483d3731573d09.
