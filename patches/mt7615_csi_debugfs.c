@@ -26,6 +26,7 @@ mt7615_csi_enable_set(void *data, u64 val)
 	struct mt76_csi_buf *csi = dev->mt76.csi_buf;
 	bool enable = !!val;
 	unsigned long flags;
+	int ret;
 
 	if (!csi)
 		return -ENOMEM;
@@ -46,13 +47,17 @@ mt7615_csi_enable_set(void *data, u64 val)
 		spin_unlock_irqrestore(&csi->lock, flags);
 
 		mt76_clear(dev, MT_DMA_DCR0, MT_DMA_DCR0_RX_VEC_DROP);
-		mt7615_mcu_set_csi(dev, true);
+		ret = mt7615_mcu_set_csi(dev, true);
+		if (ret)
+			dev_warn(dev->mt76.dev, "mt7615_mcu_set_csi(true) returned %d\n", ret);
 
 		dev_info(dev->mt76.dev, "CSI capture ENABLED (mode=%d)\n",
 			 csi->mode);
 	} else {
 		mt76_set(dev, MT_DMA_DCR0, MT_DMA_DCR0_RX_VEC_DROP);
-		mt7615_mcu_set_csi(dev, false);
+		ret = mt7615_mcu_set_csi(dev, false);
+		if (ret)
+			dev_warn(dev->mt76.dev, "mt7615_mcu_set_csi(false) returned %d\n", ret);
 
 		dev_info(dev->mt76.dev,
 			 "CSI capture DISABLED (captured=%u, dropped=%u)\n",

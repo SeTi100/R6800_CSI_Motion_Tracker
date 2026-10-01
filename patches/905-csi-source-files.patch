@@ -225,7 +225,7 @@
 +EXPORT_SYMBOL_GPL(mt76_csi_buf_read);
 --- /dev/null
 +++ b/mt7615/mt7615_csi_debugfs.c
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,291 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +/*
 + * MT7615 CSI debugfs interface
@@ -254,6 +254,7 @@
 +	struct mt76_csi_buf *csi = dev->mt76.csi_buf;
 +	bool enable = !!val;
 +	unsigned long flags;
++	int ret;
 +
 +	if (!csi)
 +		return -ENOMEM;
@@ -274,13 +275,17 @@
 +		spin_unlock_irqrestore(&csi->lock, flags);
 +
 +		mt76_clear(dev, MT_DMA_DCR0, MT_DMA_DCR0_RX_VEC_DROP);
-+		mt7615_mcu_set_csi(dev, true);
++		ret = mt7615_mcu_set_csi(dev, true);
++		if (ret)
++			dev_warn(dev->mt76.dev, "mt7615_mcu_set_csi(true) returned %d\n", ret);
 +
 +		dev_info(dev->mt76.dev, "CSI capture ENABLED (mode=%d)\n",
 +			 csi->mode);
 +	} else {
 +		mt76_set(dev, MT_DMA_DCR0, MT_DMA_DCR0_RX_VEC_DROP);
-+		mt7615_mcu_set_csi(dev, false);
++		ret = mt7615_mcu_set_csi(dev, false);
++		if (ret)
++			dev_warn(dev->mt76.dev, "mt7615_mcu_set_csi(false) returned %d\n", ret);
 +
 +		dev_info(dev->mt76.dev,
 +			 "CSI capture DISABLED (captured=%u, dropped=%u)\n",

@@ -117,11 +117,16 @@
  		rxd += 6;
  		if ((u8 *)rxd - skb->data >= skb->len)
  			return -EINVAL;
-@@ -1637,6 +1721,9 @@
+@@ -1637,6 +1721,14 @@
  		mt7615_mac_tx_free(dev, skb->data, skb->len);
  		dev_kfree_skb(skb);
  		break;
 +	case PKT_TYPE_TXRXV:
++		if (dev->mt76.csi_buf && dev->mt76.csi_buf->capture_active) {
++			dev_info_ratelimited(dev->mt76.dev, "TXRXV vector packet rx: len=%u\n", skb->len);
++			print_hex_dump(KERN_INFO, "TXRXV desc: ", DUMP_PREFIX_OFFSET,
++				       16, 1, skb->data, min_t(size_t, skb->len, 32), false);
++		}
 +		dev_kfree_skb(skb);
 +		break;
  	case PKT_TYPE_RX_EVENT:

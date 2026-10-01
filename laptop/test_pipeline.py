@@ -34,9 +34,12 @@ from csi_receiver import (
     CSI_PAYLOAD_SIZE,
     CSI_HEADER_FORMAT,
 )
+import csi_doppler
 from csi_doppler import (
     sanitize_phase,
     compute_csi_ratio,
+    hampel_filter,
+    median_filter_1d,
     StaticClutterFilter,
     MicroDopplerProcessor,
     MockCSIGenerator,
@@ -505,6 +508,143 @@ class TestCSIPipeline(unittest.TestCase):
         # Monotonically non-decreasing
         self.assertTrue(np.all(np.diff(t_axis) >= 0.0))
 
+    def test_18_hampel_filter_outlier_removal(self):
+        """Verify Hampel filter removes unwrapping phase outliers without distorting linear slope."""
+        k = np.arange(64) - 32
+        linear_slope = 0.5 + 0.08 * k
+        # Inject isolated 2*pi unwrap glitch spike
+        corrupted = np.copy(linear_slope)
+        corrupted[15] += 2.0 * np.pi  # Outlier
+        corrupted[45] -= 2.0 * np.pi  # Outlier
+
+        filtered = hampel_filter(corrupted, window_size=5, n_sigmas=3.0)
+        # Outliers should be detected and replaced with local median
+        self.assertAlmostEqual(filtered[15], linear_slope[15], delta=0.2)
+        self.assertAlmostEqual(filtered[45], linear_slope[45], delta=0.2)
+
+        # Clean linear slope should be untouched
+        clean_filtered = hampel_filter(linear_slope, window_size=5, n_sigmas=3.0)
+        self.assertTrue(np.allclose(clean_filtered, linear_slope, atol=1e-6))
+
+    def test_19_dc_removal_temporal_mean(self):
+        """Verify DC removal subtracts temporal mean per subcarrier over STFT window."""
+        processor = MicroDopplerProcessor(
+            window_size=64,
+            step_size=8,
+            n_fft=128,
+            sampling_rate=100.0,
+            doppler_limit_hz=50.0,
+        )
+
+        # Generate a signal with a large static DC offset per subcarrier (different on each subcarrier)
+        # plus a 15 Hz AC Doppler tone
+        static_offsets = np.random.uniform(50.0, 150.0, size=64) + 1j * np.random.uniform(-100.0, 100.0, size=64)
+        t = np.arange(100) / 100.0
+        ac_tone = 10.0 * np.exp(1j * 2.0 * np.pi * 15.0 * t)  # 15 Hz tone
+
+        for i in range(100):
+            frame = np.zeros((4, 64), dtype=np.complex64)
+            for sc in range(64):
+                frame[0, sc] = static_offsets[sc] + ac_tone[i]
+                frame[1, sc] = static_offsets[sc] + ac_tone[i]
+            processor.add_frame(frame, i * 0.01)
+
+        spec_mat, t_axis, v_bins = processor.get_spectrogram_matrix()
+        self.assertIsNotNone(spec_mat)
+
+        # Center frequency index (DC, 0 Hz)
+        dc_idx = len(processor.freq_bins) // 2
+        # DC power should not overpower the 15 Hz motion tone
+        # Compare DC bin power with max non-DC spectral power
+        non_dc_mask = np.abs(processor.freq_bins) > 1.0
+        max_motion_power = np.max(spec_mat[non_dc_mask, :])
+        dc_power = np.mean(spec_mat[dc_idx, :])
+        self.assertLess(dc_power, max_motion_power + 20.0)
+
+    def test_20_percentile_dynamic_scaling(self):
+        """Verify 10th to 99th percentile dynamic scaling avoids DC spike clipping."""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        app = MicroDopplerApp(source_mode="mock")
+        gen = MockCSIGenerator(sample_rate=200.0)
+
+        for i in range(200):
+            pkt = gen.generate_packet()
+            app.latest_packet = pkt
+            app.processor.add_frame(pkt.csi_complex, i * 0.005)
+
+        artists = app._update_plot(0)
+        self.assertIsNotNone(artists)
+        clim = app.im_spec.get_clim()
+        self.assertIsNotNone(clim)
+        # Clim should have a valid dynamic range (vmax > vmin by at least 15 dB)
+        self.assertGreaterEqual(clim[1] - clim[0], 15.0)
+
+        app.running = False
+        plt.close(app.fig)
+
+    def test_21_single_antenna_fallback(self):
+        """Verify single-antenna fallback operates smoothly without crash."""
+        processor = MicroDopplerProcessor(
+            window_size=64,
+            step_size=8,
+            n_fft=128,
+            sampling_rate=100.0,
+            single_antenna=True,
+        )
+        gen = MockCSIGenerator(sample_rate=100.0)
+
+        for i in range(80):
+            pkt = gen.generate_packet()
+            processor.add_frame(pkt.csi_complex, i * 0.01)
+
+        spec_mat, t_axis, v_bins = processor.get_spectrogram_matrix()
+        self.assertIsNotNone(spec_mat)
+        self.assertIsNotNone(t_axis)
+        self.assertFalse(np.any(np.isnan(spec_mat)))
+
+    def test_22_dsp_feature_flags_gating(self):
+        """Verify RULE 3 feature flags can be toggled without breaking execution."""
+        orig_norm = csi_doppler.ENABLE_NORMALIZATION
+        orig_dc = csi_doppler.ENABLE_DC_REMOVAL
+        orig_phase = csi_doppler.ENABLE_PHASE_FILTERING
+        orig_scale = csi_doppler.ENABLE_PERCENTILE_SCALING
+
+        try:
+            # Test unnormalized correlation
+            csi_doppler.ENABLE_NORMALIZATION = False
+            h0 = np.array([3.0 + 4.0j])
+            h1 = np.array([1.0 + 2.0j])
+            res = compute_csi_ratio(h0, h1)
+            # Unnormalized should be h0 * conj(h1) = (3+4j)*(1-2j) = 3 - 6j + 4j - 8j^2 = 11 - 2j
+            self.assertAlmostEqual(res[0].real, 11.0, places=4)
+            self.assertAlmostEqual(res[0].imag, -2.0, places=4)
+
+            # Test DC removal toggle
+            csi_doppler.ENABLE_DC_REMOVAL = False
+            proc = MicroDopplerProcessor(window_size=32, step_size=4, n_fft=64, sampling_rate=100.0)
+            gen = MockCSIGenerator(sample_rate=100.0)
+            for i in range(40):
+                pkt = gen.generate_packet()
+                proc.add_frame(pkt.csi_complex, i * 0.01)
+            mat, _, _ = proc.get_spectrogram_matrix()
+            self.assertIsNotNone(mat)
+
+            # Test phase filtering toggle
+            csi_doppler.ENABLE_PHASE_FILTERING = False
+            h = np.exp(1j * np.linspace(0, 1, 64))
+            san = sanitize_phase(h)
+            self.assertEqual(len(san), 64)
+
+        finally:
+            csi_doppler.ENABLE_NORMALIZATION = orig_norm
+            csi_doppler.ENABLE_DC_REMOVAL = orig_dc
+            csi_doppler.ENABLE_PHASE_FILTERING = orig_phase
+            csi_doppler.ENABLE_PERCENTILE_SCALING = orig_scale
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

@@ -50,6 +50,53 @@ WAVELENGTH_24G = SPEED_OF_LIGHT / CARRIER_FREQ_24G  # ~ 0.123 m
 CARRIER_FREQ_5G = 5.21e9       # 5.21 GHz (Channel 36-48)
 WAVELENGTH_5G = SPEED_OF_LIGHT / CARRIER_FREQ_5G    # ~ 0.0575 m
 
+# DSP Feature Flags (RULE 3 compliance)
+ENABLE_NORMALIZATION = True          # Amplitude normalization in compute_csi_ratio
+ENABLE_DC_REMOVAL = True             # Subtract temporal mean per subcarrier over STFT window
+ENABLE_PHASE_FILTERING = True        # Hampel / median filtering on raw phases to eliminate unwrap outliers
+PHASE_FILTER_METHOD = "hampel"       # "hampel" or "median"
+ENABLE_PERCENTILE_SCALING = True     # 10th-99th percentile dynamic scaling for spectrogram clim
+ENABLE_SINGLE_ANTENNA = False        # Fallback to single antenna instead of antenna conjugate cross-correlation
+
+
+def hampel_filter(x: np.ndarray, window_size: int = 5, n_sigmas: float = 3.0) -> np.ndarray:
+    """
+    Hampel filter to detect and replace outliers in a 1D sequence.
+    Computes rolling median and Median Absolute Deviation (MAD).
+    Points deviating by more than n_sigmas * MAD from the median are replaced with the median.
+    """
+    x_arr = np.asarray(x, dtype=float)
+    n = len(x_arr)
+    if n < window_size:
+        return np.copy(x_arr)
+
+    y = np.copy(x_arr)
+    k = window_size // 2
+    for i in range(n):
+        start = max(0, i - k)
+        end = min(n, i + k + 1)
+        w = x_arr[start:end]
+        med = float(np.median(w))
+        mad = 1.4826 * float(np.median(np.abs(w - med)))
+        if mad > 1e-6 and abs(x_arr[i] - med) > n_sigmas * mad:
+            y[i] = med
+    return y
+
+
+def median_filter_1d(x: np.ndarray, window_size: int = 3) -> np.ndarray:
+    """Standard 1D median filter."""
+    x_arr = np.asarray(x, dtype=float)
+    n = len(x_arr)
+    if n < window_size:
+        return np.copy(x_arr)
+    y = np.copy(x_arr)
+    k = window_size // 2
+    for i in range(n):
+        start = max(0, i - k)
+        end = min(n, i + k + 1)
+        y[i] = float(np.median(x_arr[start:end]))
+    return y
+
 
 def sanitize_phase(complex_subcarriers: np.ndarray, remove_offset: bool = False) -> np.ndarray:
     """
@@ -74,6 +121,13 @@ def _sanitize_phase_1d(h: np.ndarray, remove_offset: bool = False) -> np.ndarray
     amplitudes = np.abs(h)
     raw_phase = np.angle(h)
     unwrapped = np.unwrap(raw_phase)
+
+    # Set Hampel or median filtering to eliminate unwrap outliers (RULE 3 gated)
+    if ENABLE_PHASE_FILTERING:
+        if PHASE_FILTER_METHOD == "median":
+            unwrapped = median_filter_1d(unwrapped, window_size=3)
+        else:
+            unwrapped = hampel_filter(unwrapped, window_size=5, n_sigmas=3.0)
 
     # Subcarrier indices centered around zero (-N/2 to N/2-1)
     k = np.arange(n_sc) - (n_sc // 2)
@@ -105,13 +159,26 @@ def _sanitize_phase_1d(h: np.ndarray, remove_offset: bool = False) -> np.ndarray
     return amplitudes * np.exp(1j * sanitized_phase)
 
 
-def compute_csi_ratio(h0: np.ndarray, h1: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+def compute_csi_ratio(
+    h0: np.ndarray,
+    h1: np.ndarray,
+    eps: float = 1e-6,
+    method: str = "correlation"
+) -> np.ndarray:
     """
-    Compute antenna conjugate ratio:
-      CSI_ratio = (h0 * conj(h1)) / (|h1|^2 + eps) = h0 / h1
-    Cancels transmitter-receiver oscillator frequency drift and common phase noise.
+    Compute antenna conjugate cross-correlation or ratio:
+      - 'correlation' (recommended): (h0 * conj(h1)) / (sqrt(|h0|^2 + |h1|^2) + eps)
+        Cancels CFO & SFO without division noise explosion at fading notches.
+      - 'division': (h0 * conj(h1)) / (|h1|^2 + eps)
     """
-    return (h0)
+    cross = h0 * np.conj(h1)
+    if method == "correlation":
+        if ENABLE_NORMALIZATION:
+            denom = np.sqrt(np.abs(h0) ** 2 + np.abs(h1) ** 2) + eps
+            return cross / denom
+        return cross
+    else:
+        return cross / (np.abs(h1) ** 2 + eps)
 
 
 class StaticClutterFilter:
@@ -154,6 +221,7 @@ class MicroDopplerProcessor:
         doppler_limit_hz: float = 50.0,
         clutter_alpha: float = 0.04,
         num_doppler_bins: Optional[int] = None,
+        single_antenna: bool = False,
     ):
         self.window_size = int(window_size)
         self.step_size = int(step_size)
@@ -162,6 +230,7 @@ class MicroDopplerProcessor:
         self.carrier_freq = float(carrier_freq)
         self.wavelength = SPEED_OF_LIGHT / self.carrier_freq
         self.doppler_limit_hz = float(doppler_limit_hz)
+        self.single_antenna = single_antenna
 
         self.hanning_win = np.hanning(self.window_size)
         self.clutter_filter = StaticClutterFilter(alpha=clutter_alpha)
@@ -173,6 +242,7 @@ class MicroDopplerProcessor:
 
         # Ring buffer for raw time series: (buffer_len, 64)
         self.time_buffer = deque(maxlen=self.window_size * 2)
+        self.sc_buffer = deque(maxlen=self.window_size * 2)
         self.timestamps = deque(maxlen=self.window_size * 2)
 
         # Spectrogram history buffer (num_time_steps, num_freq_bins)
@@ -233,21 +303,24 @@ class MicroDopplerProcessor:
                 # Preserve monotonic non-decreasing timestamp axis under jitter
                 rel_t = self.timestamps[-1]
 
-            # Antenna 0 and 1 conjugate ratio
-            if csi_frame is not None and np.asarray(csi_frame).ndim >= 2 and csi_frame.shape[0] >= 2:
+            # Antenna conjugate cross-correlation or single-antenna fallback
+            if (self.single_antenna or ENABLE_SINGLE_ANTENNA) and csi_frame is not None:
+                if np.asarray(csi_frame).ndim >= 2 and csi_frame.shape[0] >= 1:
+                    csi_ratio = np.asarray(csi_frame[0], dtype=np.complex64)
+                else:
+                    csi_ratio = np.asarray(csi_frame, dtype=np.complex64)
+            elif csi_frame is not None and np.asarray(csi_frame).ndim >= 2 and csi_frame.shape[0] >= 2:
                 h0 = csi_frame[0]
                 h1 = csi_frame[1]
-                csi_ratio = compute_csi_ratio(h0, h1)
+                csi_ratio = compute_csi_ratio(h0, h1, method="correlation")
             elif csi_frame is not None and np.asarray(csi_frame).ndim == 1:
-                csi_ratio = np.asarray(csi_frame)
+                csi_ratio = np.asarray(csi_frame, dtype=np.complex64)
             else:
                 csi_ratio = np.zeros(64, dtype=np.complex64)
 
-            # Sanitize phase
-            sanitized_ratio = _sanitize_phase_1d(csi_ratio)
-
             # Apply static clutter filter across time
-            dynamic_ratio = self.clutter_filter.filter(sanitized_ratio)
+            dynamic_ratio = self.clutter_filter.filter(csi_ratio)
+            self.sc_buffer.append(np.copy(dynamic_ratio))
 
             # Aggregate across active subcarriers (e.g. 4:60 for 20 MHz HT with 56 usable subcarriers)
             if len(dynamic_ratio) > 8:
@@ -274,7 +347,37 @@ class MicroDopplerProcessor:
 
     def _compute_stft_slice(self, timestamp_s: float):
         """Compute FFT for the latest window and store into spectrogram history."""
-        signal_slice = np.array(list(self.time_buffer)[-self.window_size:])
+        # DC removal before STFT: Subtract temporal mean per subcarrier over STFT window
+        if len(self.sc_buffer) >= self.window_size:
+            raw_window = np.array(list(self.sc_buffer)[-self.window_size:])
+            if raw_window.ndim == 2 and raw_window.shape[0] == self.window_size:
+                if ENABLE_DC_REMOVAL:
+                    mean_per_sc = np.mean(raw_window, axis=0, keepdims=True)
+                    window_no_dc = raw_window - mean_per_sc
+                else:
+                    window_no_dc = raw_window
+
+                n_sc = window_no_dc.shape[1]
+                if n_sc > 8:
+                    sc_start = min(4, n_sc // 8)
+                    sc_end = max(sc_start + 1, n_sc - sc_start)
+                    signal_slice = np.mean(window_no_dc[:, sc_start:sc_end], axis=1)
+                elif n_sc > 0:
+                    signal_slice = np.mean(window_no_dc, axis=1)
+                else:
+                    signal_slice = np.zeros(self.window_size, dtype=np.complex64)
+            else:
+                signal_slice = np.array(list(self.time_buffer)[-self.window_size:])
+                if ENABLE_DC_REMOVAL:
+                    signal_slice = signal_slice - np.mean(signal_slice)
+        else:
+            signal_slice = np.array(list(self.time_buffer)[-self.window_size:])
+            if ENABLE_DC_REMOVAL:
+                signal_slice = signal_slice - np.mean(signal_slice)
+
+        if ENABLE_DC_REMOVAL and len(signal_slice) > 0:
+            signal_slice = signal_slice - np.mean(signal_slice)
+
         windowed = signal_slice * self.hanning_win
         fft_vals = np.fft.fftshift(np.fft.fft(windowed, n=self.n_fft))
         power_spectrum = np.abs(fft_vals) ** 2
