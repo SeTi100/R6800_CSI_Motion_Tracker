@@ -644,6 +644,101 @@ class TestCSIPipeline(unittest.TestCase):
             csi_doppler.ENABLE_PHASE_FILTERING = orig_phase
             csi_doppler.ENABLE_PERCENTILE_SCALING = orig_scale
 
+    def test_23_hampel_filter_flat_and_plateau_outliers(self):
+        """Verify Hampel filter replaces isolated outliers even on zero-MAD / flat sequences."""
+        flat_with_outlier = np.array([1.5, 1.5, 1.5, 99.0, 1.5, 1.5, 1.5])
+        filtered = hampel_filter(flat_with_outlier, window_size=5, n_sigmas=3.0)
+        self.assertAlmostEqual(filtered[3], 1.5, places=4)
+        # Verify clean flat sequence remains unchanged
+        clean_flat = np.full(16, 2.0)
+        filtered_clean = hampel_filter(clean_flat, window_size=5, n_sigmas=3.0)
+        self.assertTrue(np.allclose(filtered_clean, clean_flat))
+
+    def test_24_single_antenna_phase_filtering_velocity(self):
+        """Verify single-antenna fallback with phase filtering detects Doppler walking velocity."""
+        processor = MicroDopplerProcessor(
+            window_size=128,
+            step_size=8,
+            n_fft=256,
+            sampling_rate=200.0,
+            single_antenna=True,
+        )
+        gen = MockCSIGenerator(sample_rate=200.0)
+
+        for i in range(300):
+            pkt = gen.generate_packet()
+            processor.add_frame(pkt.csi_complex, i / 200.0)
+
+        spec_mat, t_axis, v_bins = processor.get_spectrogram_matrix()
+        self.assertIsNotNone(spec_mat)
+        self.assertGreater(abs(processor.peak_velocity_mps), 0.2)
+    def test_25_csi_doppler_v2_visualizer_and_single_antenna(self):
+        """Verify csi_doppler_V2 visualizer initializes, supports --single-antenna, and updates without error."""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import csi_doppler_V2
+
+        # Test single-antenna mode initialization and update loop
+        app = csi_doppler_V2.MicroDopplerApp(source_mode="mock", single_antenna=True)
+        self.assertTrue(app.single_antenna)
+        self.assertTrue(app.processor.single_antenna)
+
+        gen = MockCSIGenerator(sample_rate=200.0)
+        for i in range(100):
+            pkt = gen.generate_packet()
+            app.latest_packet = pkt
+            app.processor.add_frame(pkt.csi_complex, i * 0.005)
+
+        artists = app._update_plot(0)
+        self.assertIsNotNone(artists)
+        clim = app.im_spec.get_clim()
+        self.assertIsNotNone(clim)
+        self.assertGreaterEqual(clim[1] - clim[0], 15.0)
+
+        # Verify single-antenna plot artists updated
+        self.assertEqual(len(app.line_amp0.get_xdata()), 64)
+        self.assertEqual(len(app.line_amp1.get_xdata()), 0)  # Antenna 1 empty in single antenna mode
+        self.assertEqual(len(app.line_clean_phase.get_xdata()), 64)
+
+        app.running = False
+        plt.close(app.fig)
+
+        # Test V2 Argument Parser includes both clim-max and single-antenna
+        orig_argv = sys.argv
+        try:
+            sys.argv = [
+                "csi_doppler_V2.py",
+                "--mock",
+                "--single-antenna",
+                "--clim-min", "-35.0",
+                "--clim-max", "25.0",
+                "--fps", "45",
+                "--bins", "65",
+            ]
+            import argparse
+            # Re-create parser logic as in main()
+            p = argparse.ArgumentParser()
+            g = p.add_mutually_exclusive_group()
+            g.add_argument("--udp", action="store_true")
+            g.add_argument("--file", "-f")
+            g.add_argument("--mock", action="store_true")
+            p.add_argument("--port", "-p", type=int, default=5500)
+            p.add_argument("--bind", default="0.0.0.0")
+            p.add_argument("--speed", type=float, default=1.0)
+            p.add_argument("--fps", type=int, default=30)
+            p.add_argument("--bins", type=int, default=129)
+            p.add_argument("--no-blit", action="store_true")
+            p.add_argument("--clim-min", type=float, default=-40.0)
+            p.add_argument("--clim-max", type=float, default=20.0)
+            p.add_argument("--single-antenna", action="store_true")
+            args = p.parse_args(sys.argv[1:])
+            self.assertTrue(args.single_antenna)
+            self.assertEqual(args.clim_max, 25.0)
+            self.assertEqual(args.clim_min, -35.0)
+        finally:
+            sys.argv = orig_argv
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

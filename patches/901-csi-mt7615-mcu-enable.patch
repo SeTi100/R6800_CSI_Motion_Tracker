@@ -30,25 +30,36 @@
  #endif
 --- a/mt7615/mcu.c
 +++ b/mt7615/mcu.c
-@@ -435,6 +435,9 @@
- 		break;
+@@ -436,6 +436,9 @@
  	case MCU_EXT_EVENT_FW_LOG_2_HOST:
  		mt7615_mcu_rx_log_message(dev, skb);
+ 		break;
++	case MCU_EXT_EVENT_CSI_REPORT:
++		mt7615_mcu_rx_csi(dev, skb);
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -539,6 +542,9 @@
+ 	switch (rxd->eid) {
+ 	case MCU_EVENT_EXT:
+ 		mt7615_mcu_rx_ext_event(dev, skb);
 +		break;
 +	case MCU_EXT_EVENT_CSI_REPORT:
 +		mt7615_mcu_rx_csi(dev, skb);
  		break;
- 	default:
- 		break;
-@@ -571,6 +574,7 @@
+ 	case MCU_EVENT_BSS_BEACON_LOSS:
+ 		mt7615_mcu_beacon_loss_event(dev, skb);
+@@ -571,6 +577,8 @@
  	    rxd->ext_eid == MCU_EXT_EVENT_FW_LOG_2_HOST ||
  	    rxd->ext_eid == MCU_EXT_EVENT_ASSERT_DUMP ||
  	    rxd->ext_eid == MCU_EXT_EVENT_PS_SYNC ||
 +	    rxd->ext_eid == MCU_EXT_EVENT_CSI_REPORT ||
++	    rxd->eid == MCU_EXT_EVENT_CSI_REPORT ||
  	    rxd->eid == MCU_EVENT_BSS_BEACON_LOSS ||
  	    rxd->eid == MCU_EVENT_SCHED_SCAN_DONE ||
  	    rxd->eid == MCU_EVENT_BSS_ABSENCE ||
-@@ -2611,3 +2615,90 @@
+@@ -2611,3 +2619,101 @@
  	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(PROTECT_CTRL), &req,
  				 sizeof(req), true);
  }
@@ -70,6 +81,7 @@
 +
 +void mt7615_mcu_rx_csi(struct mt7615_dev *dev, struct sk_buff *skb)
 +{
++	static DEFINE_RATELIMIT_STATE(csi_rs, HZ, 5);
 +	struct mt7615_mcu_rxd *rxd;
 +	struct mt76_csi_buf *csi_buf = dev->mt76.csi_buf;
 +	struct mt76_csi_data *csi_rec;
@@ -88,15 +100,25 @@
 +	payload = skb->data + sizeof(*rxd);
 +	payload_len = skb->len - sizeof(*rxd);
 +
-+	dev_info_ratelimited(dev->mt76.dev,
-+		"MCU_EXT_EVENT_CSI_REPORT: skb_len=%u, payload_len=%zu\n",
-+		skb->len, payload_len);
-+	print_hex_dump(KERN_INFO, "CSI MCU payload: ", DUMP_PREFIX_OFFSET,
-+		       16, 1, payload, min_t(size_t, payload_len, 64), false);
++	if (payload_len < 4)
++		return;
++
++	if (__ratelimit(&csi_rs)) {
++		dev_info(dev->mt76.dev,
++			 "MCU_EXT_EVENT_CSI_REPORT: skb_len=%u, payload_len=%zu\n",
++			 skb->len, payload_len);
++		print_hex_dump(KERN_INFO, "CSI MCU payload: ", DUMP_PREFIX_OFFSET,
++			       16, 1, payload, min_t(size_t, payload_len, 64), false);
++	}
 +
 +	spin_lock_irqsave(&csi_buf->lock, flags);
 +	csi_rec = mt76_csi_buf_write_begin(csi_buf);
 +	if (csi_rec) {
++		u32 seq = csi_rec->seq_num;
++		/* Zero-initialize metadata and IQ buffers to avoid leaking uninitialized ring buffer data */
++		memset(csi_rec, 0, sizeof(*csi_rec));
++		csi_rec->seq_num = seq;
++
 +		csi_rec->timestamp_us = ktime_to_us(ktime_get());
 +		if (dev->mt76.phy.chandef.chan)
 +			csi_rec->channel = dev->mt76.phy.chandef.chan->hw_value;

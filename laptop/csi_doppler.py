@@ -77,7 +77,8 @@ def hampel_filter(x: np.ndarray, window_size: int = 5, n_sigmas: float = 3.0) ->
         w = x_arr[start:end]
         med = float(np.median(w))
         mad = 1.4826 * float(np.median(np.abs(w - med)))
-        if mad > 1e-6 and abs(x_arr[i] - med) > n_sigmas * mad:
+        threshold = n_sigmas * mad if mad > 1e-6 else 1e-3
+        if abs(x_arr[i] - med) > threshold:
             y[i] = med
     return y
 
@@ -320,12 +321,16 @@ class MicroDopplerProcessor:
                     csi_ratio = np.asarray(csi_frame[0], dtype=np.complex64)
                 else:
                     csi_ratio = np.asarray(csi_frame, dtype=np.complex64)
+                if ENABLE_PHASE_FILTERING:
+                    csi_ratio = _sanitize_phase_1d(csi_ratio)
             elif csi_frame is not None and np.asarray(csi_frame).ndim >= 2 and csi_frame.shape[0] >= 2:
                 h0 = csi_frame[0]
                 h1 = csi_frame[1]
                 csi_ratio = compute_csi_ratio(h0, h1, method="correlation")
             elif csi_frame is not None and np.asarray(csi_frame).ndim == 1:
                 csi_ratio = np.asarray(csi_frame, dtype=np.complex64)
+                if ENABLE_PHASE_FILTERING:
+                    csi_ratio = _sanitize_phase_1d(csi_ratio)
             else:
                 csi_ratio = np.zeros(64, dtype=np.complex64)
 

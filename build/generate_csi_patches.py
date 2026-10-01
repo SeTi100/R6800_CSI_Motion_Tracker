@@ -102,9 +102,21 @@ new_rx_ext = '''\tcase MCU_EXT_EVENT_FW_LOG_2_HOST:
 \t\tmt7615_mcu_rx_csi(dev, skb);
 \t\tbreak;'''
 mod = orig.replace(old_rx_ext, new_rx_ext)
+old_unsol = '''\tcase MCU_EVENT_EXT:
+\t\tmt7615_mcu_rx_ext_event(dev, skb);
+\t\tbreak;'''
+new_unsol = '''\tcase MCU_EVENT_EXT:
+\t\tmt7615_mcu_rx_ext_event(dev, skb);
+\t\tbreak;
+\tcase MCU_EXT_EVENT_CSI_REPORT:
+\t\tmt7615_mcu_rx_csi(dev, skb);
+\t\tbreak;'''
+mod = mod.replace(old_unsol, new_unsol)
+
 old_rx_ev = '''\t    rxd->ext_eid == MCU_EXT_EVENT_PS_SYNC ||'''
 new_rx_ev = '''\t    rxd->ext_eid == MCU_EXT_EVENT_PS_SYNC ||
-\t    rxd->ext_eid == MCU_EXT_EVENT_CSI_REPORT ||'''
+\t    rxd->ext_eid == MCU_EXT_EVENT_CSI_REPORT ||
+\t    rxd->eid == MCU_EXT_EVENT_CSI_REPORT ||'''
 mod = mod.replace(old_rx_ev, new_rx_ev)
 
 csi_mcu_impl = '''int mt7615_mcu_set_csi(struct mt7615_dev *dev, bool enable)
@@ -124,6 +136,7 @@ csi_mcu_impl = '''int mt7615_mcu_set_csi(struct mt7615_dev *dev, bool enable)
 
 void mt7615_mcu_rx_csi(struct mt7615_dev *dev, struct sk_buff *skb)
 {
+\tstatic DEFINE_RATELIMIT_STATE(csi_rs, HZ, 5);
 \tstruct mt7615_mcu_rxd *rxd;
 \tstruct mt76_csi_buf *csi_buf = dev->mt76.csi_buf;
 \tstruct mt76_csi_data *csi_rec;
@@ -142,15 +155,25 @@ void mt7615_mcu_rx_csi(struct mt7615_dev *dev, struct sk_buff *skb)
 \tpayload = skb->data + sizeof(*rxd);
 \tpayload_len = skb->len - sizeof(*rxd);
 
-\tdev_info_ratelimited(dev->mt76.dev,
-\t\t"MCU_EXT_EVENT_CSI_REPORT: skb_len=%u, payload_len=%zu\\n",
-\t\tskb->len, payload_len);
-\tprint_hex_dump(KERN_INFO, "CSI MCU payload: ", DUMP_PREFIX_OFFSET,
-\t\t       16, 1, payload, min_t(size_t, payload_len, 64), false);
+\tif (payload_len < 4)
+\t\treturn;
+
+\tif (__ratelimit(&csi_rs)) {
+\t\tdev_info(dev->mt76.dev,
+\t\t\t "MCU_EXT_EVENT_CSI_REPORT: skb_len=%u, payload_len=%zu\\n",
+\t\t\t skb->len, payload_len);
+\t\tprint_hex_dump(KERN_INFO, "CSI MCU payload: ", DUMP_PREFIX_OFFSET,
+\t\t\t       16, 1, payload, min_t(size_t, payload_len, 64), false);
+\t}
 
 \tspin_lock_irqsave(&csi_buf->lock, flags);
 \tcsi_rec = mt76_csi_buf_write_begin(csi_buf);
 \tif (csi_rec) {
+\t\tu32 seq = csi_rec->seq_num;
+\t\t/* Zero-initialize metadata and IQ buffers to avoid leaking uninitialized ring buffer data */
+\t\tmemset(csi_rec, 0, sizeof(*csi_rec));
+\t\tcsi_rec->seq_num = seq;
+
 \t\tcsi_rec->timestamp_us = ktime_to_us(ktime_get());
 \t\tif (dev->mt76.phy.chandef.chan)
 \t\t\tcsi_rec->channel = dev->mt76.phy.chandef.chan->hw_value;
@@ -332,9 +355,13 @@ new_q = '''\tcase PKT_TYPE_TXRX_NOTIFY:
 \t\tbreak;
 \tcase PKT_TYPE_TXRXV:
 \t\tif (dev->mt76.csi_buf && dev->mt76.csi_buf->capture_active) {
-\t\t\tdev_info_ratelimited(dev->mt76.dev, "TXRXV vector packet rx: len=%u\\n", skb->len);
-\t\t\tprint_hex_dump(KERN_INFO, "TXRXV desc: ", DUMP_PREFIX_OFFSET,
-\t\t\t\t       16, 1, skb->data, min_t(size_t, skb->len, 32), false);
+\t\t\tstatic DEFINE_RATELIMIT_STATE(txrxv_rs, HZ, 5);
+
+\t\t\tif (__ratelimit(&txrxv_rs)) {
+\t\t\t\tdev_info(dev->mt76.dev, "TXRXV vector packet rx: len=%u\\n", skb->len);
+\t\t\t\tprint_hex_dump(KERN_INFO, "TXRXV desc: ", DUMP_PREFIX_OFFSET,
+\t\t\t\t\t       16, 1, skb->data, min_t(size_t, skb->len, 32), false);
+\t\t\t}
 \t\t}
 \t\tdev_kfree_skb(skb);
 \t\tbreak;'''

@@ -78,7 +78,8 @@ def hampel_filter(x: np.ndarray, window_size: int = 5, n_sigmas: float = 3.0) ->
         w = x_arr[start:end]
         med = float(np.median(w))
         mad = 1.4826 * float(np.median(np.abs(w - med)))
-        if mad > 1e-6 and abs(x_arr[i] - med) > n_sigmas * mad:
+        threshold = n_sigmas * mad if mad > 1e-6 else 1e-3
+        if abs(x_arr[i] - med) > threshold:
             y[i] = med
     return y
 
@@ -309,12 +310,16 @@ class MicroDopplerProcessor:
                     csi_ratio = np.asarray(csi_frame[0], dtype=np.complex64)
                 else:
                     csi_ratio = np.asarray(csi_frame, dtype=np.complex64)
+                if ENABLE_PHASE_FILTERING:
+                    csi_ratio = _sanitize_phase_1d(csi_ratio)
             elif csi_frame is not None and np.asarray(csi_frame).ndim >= 2 and csi_frame.shape[0] >= 2:
                 h0 = csi_frame[0]
                 h1 = csi_frame[1]
                 csi_ratio = compute_csi_ratio(h0, h1, method="correlation")
             elif csi_frame is not None and np.asarray(csi_frame).ndim == 1:
                 csi_ratio = np.asarray(csi_frame, dtype=np.complex64)
+                if ENABLE_PHASE_FILTERING:
+                    csi_ratio = _sanitize_phase_1d(csi_ratio)
             else:
                 csi_ratio = np.zeros(64, dtype=np.complex64)
 
@@ -585,6 +590,7 @@ class MicroDopplerApp:
         bind_ip: str = "0.0.0.0",
         file_path: Optional[str] = None,
         speed: float = 1.0,
+        single_antenna: bool = False,
         target_fps: int = 30,
         num_doppler_bins: int = 129,
         use_blit: bool = True,
@@ -596,6 +602,7 @@ class MicroDopplerApp:
         self.bind_ip = bind_ip
         self.file_path = file_path
         self.speed = speed
+        self.single_antenna = single_antenna
         self.target_fps = max(10, min(int(target_fps), 60))
         self.use_blit = use_blit
         self.num_doppler_bins = int(num_doppler_bins)
@@ -603,7 +610,10 @@ class MicroDopplerApp:
         self.clim_max = float(clim_max)
 
         self.running = True
-        self.processor = MicroDopplerProcessor(num_doppler_bins=self.num_doppler_bins)
+        self.processor = MicroDopplerProcessor(
+            single_antenna=self.single_antenna,
+            num_doppler_bins=self.num_doppler_bins
+        )
 
         # Thread-safe buffer for incoming packets
         self.latest_packet: Optional[CSIPacket] = None
@@ -799,7 +809,29 @@ class MicroDopplerApp:
                 self.ax_vel.set_ylim(-v_max, v_max)
                 needs_redraw = True
 
-            if pkt.csi_complex is not None and np.asarray(pkt.csi_complex).ndim >= 2 and pkt.csi_complex.shape[0] >= 2:
+            if (self.single_antenna or ENABLE_SINGLE_ANTENNA) and pkt.csi_complex is not None:
+                # Single-antenna fallback visualization
+                h0 = pkt.csi_complex[0] if np.asarray(pkt.csi_complex).ndim >= 2 else pkt.csi_complex
+                amp0 = np.abs(h0)
+                x_sc = np.arange(len(amp0))
+
+                self.line_amp0.set_data(x_sc, amp0)
+                self.line_amp1.set_data([], [])
+
+                if len(amp0) > 0:
+                    max_amp = max(float(np.max(amp0)), 10.0)
+                    if max_amp > self._current_amp_ylim * 0.95 or max_amp < self._current_amp_ylim * 0.25:
+                        self._current_amp_ylim = max(float(max_amp * 1.5), 50.0)
+                        self.ax_amp.set_ylim(0, self._current_amp_ylim)
+                        needs_redraw = True
+
+                raw_phase = np.angle(h0)
+                sanitized = _sanitize_phase_1d(h0)
+                clean_phase = np.angle(sanitized)
+
+                self.line_raw_phase.set_data(x_sc, raw_phase)
+                self.line_clean_phase.set_data(x_sc, clean_phase)
+            elif pkt.csi_complex is not None and np.asarray(pkt.csi_complex).ndim >= 2 and pkt.csi_complex.shape[0] >= 2:
                 h0 = pkt.csi_complex[0]
                 h1 = pkt.csi_complex[1]
 
@@ -851,6 +883,19 @@ class MicroDopplerApp:
 
             self.im_spec.set_data(self.spec_buffer)
             self._last_rendered_slice_count = curr_slice_count
+
+            if ENABLE_PERCENTILE_SCALING:
+                finite_vals = self.spec_buffer[np.isfinite(self.spec_buffer)]
+                if len(finite_vals) > 0:
+                    non_dc_mask = np.abs(self.processor.freq_bins) > 1.0
+                    if np.any(non_dc_mask) and self.spec_buffer.shape[0] == len(self.processor.freq_bins):
+                        scale_vals = self.spec_buffer[non_dc_mask, :]
+                        scale_finite = scale_vals[np.isfinite(scale_vals)]
+                        if len(scale_finite) > 0:
+                            finite_vals = scale_finite
+                    p10 = float(np.percentile(finite_vals, 10))
+                    p99 = float(np.percentile(finite_vals, 99))
+                    self.im_spec.set_clim(vmin=p10, vmax=max(p99, p10 + 15.0))
 
         # 3. Status text update (only redraws text when content actually changes)
         vel = self.processor.peak_velocity_mps
@@ -914,8 +959,13 @@ def main():
     parser.add_argument("--no-blit", action="store_true", help="Disable blitting (fallback to full redraws)")
     parser.add_argument("--clim-min", type=float, default=-40.0, help="Spectrogram colormap min dB (default: -40.0)")
     parser.add_argument("--clim-max", type=float, default=20.0, help="Spectrogram colormap max dB (default: 20.0)")
+    parser.add_argument("--single-antenna", action="store_true", help="Fallback to single-antenna processing (Rx0)")
 
     args = parser.parse_args()
+
+    if args.single_antenna:
+        global ENABLE_SINGLE_ANTENNA
+        ENABLE_SINGLE_ANTENNA = True
 
     mode = "mock" if args.mock else ("file" if args.file else "udp")
 
@@ -929,6 +979,8 @@ def main():
         print(f"  Playback File:  {args.file} (speed: {args.speed}x)")
     elif mode == "mock":
         print("  Simulation:     Human walking & arm swing (+/- 1.4 m/s Doppler)")
+    if args.single_antenna:
+        print("  Antenna Mode:   Single-antenna fallback (Rx0)")
     print(f"  Target FPS:     {args.fps} FPS")
     print(f"  Doppler Bins:   {args.bins}")
     print(f"  Color Range:    [{args.clim_min:.1f}, {args.clim_max:.1f}] dB")
@@ -942,6 +994,7 @@ def main():
         bind_ip=args.bind,
         file_path=args.file,
         speed=args.speed,
+        single_antenna=args.single_antenna,
         target_fps=args.fps,
         num_doppler_bins=args.bins,
         use_blit=(not args.no_blit),
