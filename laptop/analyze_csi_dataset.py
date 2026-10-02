@@ -48,6 +48,7 @@ def load_dataset(filepath: str) -> dict:
         "rssi": data["rssi"],
         "band": data["band"] if "band" in data else np.zeros(len(ts)),
         "channel": data["channel"] if "channel" in data else np.zeros(len(ts)),
+        "foe": data["foe"] if "foe" in data else None,
         "csi": csi,  # Shape (N, 4, 64) complex
     }
 
@@ -57,24 +58,50 @@ def compute_metrics(dataset: dict) -> dict:
     csi = dataset["csi"]  # (N, N_ant, N_subcarriers)
     n_pkts = len(csi)
 
-    # 1. RSSI metrics per antenna
+    # 1. RSSI metrics per antenna & 4-Antenna Spatial Covariance
     rssi = dataset["rssi"]
     rssi_means = np.mean(rssi, axis=0) if len(rssi) > 0 else np.zeros(4)
     rssi_stds = np.std(rssi, axis=0) if len(rssi) > 0 else np.zeros(4)
 
-    # 2. Subcarrier Amplitude Frequency Selectivity
-    # Physical multipath exhibits irregular tone-to-tone variations (peaks and fading notches).
+    if len(rssi) > 1 and rssi.shape[1] >= 4:
+        rssi_cov = np.cov(rssi[:, :4], rowvar=False)  # 4x4 spatial covariance matrix R = E[(r - mu)(r - mu)^T]
+        rssi_eigvals = np.linalg.eigvalsh(rssi_cov)
+        spatial_trace = float(np.trace(rssi_cov))
+        spatial_dominant_energy = float(rssi_eigvals[-1])
+        spatial_cond = float(rssi_eigvals[-1] / (rssi_eigvals[0] + 1e-6))
+    else:
+        rssi_cov = np.zeros((4, 4))
+        rssi_eigvals = np.zeros(4)
+        spatial_trace = 0.0
+        spatial_dominant_energy = 0.0
+        spatial_cond = 1.0
+
+    # 2. FOE Doppler drift metrics (Frequency Offset Estimation)
+    foe = dataset.get("foe")
+    if foe is not None and len(foe) > 1:
+        foe_mean = float(np.mean(foe))
+        foe_std = float(np.std(foe))
+        foe_drift = foe - foe_mean
+        foe_drift_var = float(np.var(foe_drift))
+    else:
+        foe_mean = 0.0
+        foe_std = 0.0
+        foe_drift_var = 0.0
+
+    # 3. Subcarrier Amplitude Frequency Selectivity
     amp = np.abs(csi)  # (N, 4, 64)
-    # Mean amplitude spectrum across subcarriers for Rx0
     rx0_amp_mean = np.mean(amp[:, 0, :], axis=0) if amp.shape[1] > 0 else np.zeros(64)
     rx0_amp_std_over_tones = np.std(rx0_amp_mean)
     rx0_amp_mean_val = np.mean(rx0_amp_mean)
-    # Frequency selectivity ratio (higher = more multipath fading diversity across tones)
     freq_selectivity = (rx0_amp_std_over_tones / (rx0_amp_mean_val + 1e-6)) if rx0_amp_mean_val > 0 else 0.0
 
-    # 3. Dynamic Motion Energy Ratio (Doppler power distribution)
-    # Compute antenna conjugate product H0 * conj(H1)
-    if amp.shape[1] >= 2:
+    # 4. Multi-Antenna Ratio Diversity & Dynamic Motion Energy
+    if amp.shape[1] >= 4:
+        cross_01 = csi[:, 0, :] * np.conj(csi[:, 1, :])
+        cross_02 = csi[:, 0, :] * np.conj(csi[:, 2, :])
+        cross_03 = csi[:, 0, :] * np.conj(csi[:, 3, :])
+        cross = (cross_01 + cross_02 + cross_03) / 3.0
+    elif amp.shape[1] >= 2:
         cross = csi[:, 0, :] * np.conj(csi[:, 1, :])
     else:
         cross = csi[:, 0, :]
@@ -86,7 +113,7 @@ def compute_metrics(dataset: dict) -> dict:
     temporal_variance = np.mean(np.var(np.abs(cross), axis=0))
     dynamic_motion_energy = np.mean(np.var(cross_detrend, axis=0))
 
-    # 4. Zero CFR detection (checks if data is blanked/zeroed)
+    # 5. Zero CFR detection (checks if data is blanked/zeroed)
     is_all_zeros = np.all(amp == 0.0)
     has_valid_cfr = not is_all_zeros and np.any(amp > 0.0)
 
@@ -96,6 +123,14 @@ def compute_metrics(dataset: dict) -> dict:
         "sample_rate_hz": dataset["mean_rate_hz"],
         "rssi_means": rssi_means,
         "rssi_stds": rssi_stds,
+        "spatial_cov": rssi_cov,
+        "spatial_eigvals": rssi_eigvals,
+        "spatial_trace": spatial_trace,
+        "spatial_dominant_energy": spatial_dominant_energy,
+        "spatial_cond": spatial_cond,
+        "foe_mean": foe_mean,
+        "foe_std": foe_std,
+        "foe_drift_var": foe_drift_var,
         "has_valid_cfr": has_valid_cfr,
         "freq_selectivity": freq_selectivity,
         "temporal_variance": temporal_variance,
@@ -112,9 +147,16 @@ def print_report(name: str, m: dict):
     print(f"  Packets Captured:        {m['n_packets']}")
     print(f"  Capture Duration:        {m['duration_s']:.2f} s")
     print(f"  Effective Sample Rate:   {m['sample_rate_hz']:.1f} Hz")
-    print(f"  Antenna RSSI (dBm):      Rx0: {m['rssi_means'][0]:.1f} ± {m['rssi_stds'][0]:.2f} dBm")
-    if len(m['rssi_means']) > 1:
-        print(f"                           Rx1: {m['rssi_means'][1]:.1f} ± {m['rssi_stds'][1]:.2f} dBm")
+    if len(m['rssi_means']) >= 4:
+        print(f"  4-Antenna RSSI (dBm):    Rx0: {m['rssi_means'][0]:.1f}±{m['rssi_stds'][0]:.2f}  Rx1: {m['rssi_means'][1]:.1f}±{m['rssi_stds'][1]:.2f}")
+        print(f"                           Rx2: {m['rssi_means'][2]:.1f}±{m['rssi_stds'][2]:.2f}  Rx3: {m['rssi_means'][3]:.1f}±{m['rssi_stds'][3]:.2f}")
+    else:
+        print(f"  Antenna RSSI (dBm):      Rx0: {m['rssi_means'][0]:.1f} ± {m['rssi_stds'][0]:.2f} dBm")
+    print("-" * 65)
+    print("  4-Antenna Spatial Covariance & Hardware FOE:")
+    print(f"  Spatial Covariance Trace:   {m['spatial_trace']:.4f} (total 4-antenna fluctuation)")
+    print(f"  Dominant Spatial Eigenval:  {m['spatial_dominant_energy']:.4f} (primary spatial mode)")
+    print(f"  FOE Mean / Drift Variance:  {m['foe_mean']:.1f} Hz / {m['foe_drift_var']:.4f}")
     print("-" * 65)
     print("  Physical Channel Diagnostics:")
     print(f"  Valid Non-Zero CFR:      {'YES' if m['has_valid_cfr'] else 'NO (Zeroed IQ buffers)'}")
@@ -122,9 +164,10 @@ def print_report(name: str, m: dict):
     print(f"  Temporal Motion Energy:  {m['dynamic_motion_energy']:.3f} (dynamic fluctuation power)")
     print("-" * 65)
     if not m['has_valid_cfr']:
-        print("  [!] Note: Subcarrier I/Q values are currently zero in this dataset.")
-        print("      To capture complex CFR matrices, activate VHT BFR action frames")
-        print("      using 'python laptop/vht_bfr_decompressor.py'.")
+        if m['spatial_trace'] > 1.0 or m['foe_drift_var'] > 5.0:
+            print("  [+] Assessment: Motion detected via 4-antenna spatial covariance & FOE drift!")
+        else:
+            print("  [+] Assessment: Low spatial/FOE fluctuation (Static baseline).")
     elif m['dynamic_motion_energy'] > 10.0:
         print("  [+] Assessment: High dynamic fluctuation detected (Walking / Locomotion).")
     else:

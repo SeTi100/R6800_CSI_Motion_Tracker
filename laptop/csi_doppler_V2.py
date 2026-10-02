@@ -264,6 +264,35 @@ def compute_csi_ratio(
         return cross / (np.abs(h1) ** 2 + eps)
 
 
+def compute_multi_antenna_ratio(
+    csi_frame: np.ndarray,
+    eps: float = 1e-6,
+    method: str = "correlation"
+) -> np.ndarray:
+    """
+    Compute multi-antenna ratio diversity combining across spatial channels:
+      - For 4 antennas: combines conjugate pairs (0,1), (0,2), (0,3) to cancel fading notches
+      - For 2 antennas: standard pair (0,1)
+      - For 1 antenna: single channel fallback
+    """
+    frame = np.asarray(csi_frame)
+    if frame.ndim == 1:
+        return np.asarray(frame, dtype=np.complex64)
+
+    n_ant = frame.shape[0]
+    if n_ant >= 4:
+        r01 = compute_csi_ratio(frame[0], frame[1], eps=eps, method=method)
+        r02 = compute_csi_ratio(frame[0], frame[2], eps=eps, method=method)
+        r03 = compute_csi_ratio(frame[0], frame[3], eps=eps, method=method)
+        return (r01 + r02 + r03) / 3.0
+    elif n_ant >= 2:
+        return compute_csi_ratio(frame[0], frame[1], eps=eps, method=method)
+    elif n_ant == 1:
+        return np.asarray(frame[0], dtype=np.complex64)
+    else:
+        return np.zeros(64, dtype=np.complex64)
+
+
 class StaticClutterFilter:
     """
     Removes static DC clutter (reflections from walls/furniture)
@@ -327,6 +356,26 @@ class MicroDopplerProcessor:
         self.use_pca = use_pca
         self.use_subcarrier_prefilter = use_subcarrier_prefilter
         self.last_pca_evr = 0.0
+
+        # 4-Antenna Spatial Covariance & FOE Doppler Drift
+        self.rssi_buffer = deque(maxlen=self.window_size)
+        self.foe_buffer = deque(maxlen=self.window_size)
+        self.foe_drift_buffer = deque(maxlen=self.window_size)
+        self.foe_ema: Optional[float] = None
+        self.foe_ema_alpha = 0.05
+        self.last_spatial_cov = np.zeros((4, 4), dtype=np.float32)
+        self.last_spatial_eigvals = np.zeros(4, dtype=np.float32)
+        self.last_spatial_trace = 0.0
+        self.last_spatial_motion_power = 0.0
+        self.last_foe = 0.0
+        self.last_foe_drift = 0.0
+        self.last_foe_drift_var = 0.0
+        self.foe_integrated_phase = 0.0
+        self.is_raw_cfr = False
+        self.rf_diff01_buffer = deque(maxlen=64)
+        self.rf_diff23_buffer = deque(maxlen=64)
+        self.rf_foe_drift_buffer = deque(maxlen=64)
+        self.rf_rssi_history = deque(maxlen=64)
 
         self.hanning_win = np.hanning(self.window_size)
         self.clutter_filter = StaticClutterFilter(alpha=clutter_alpha)
@@ -396,15 +445,51 @@ class MicroDopplerProcessor:
                 self.fs = float(fs)
                 self.current_fft_freqs = np.fft.fftshift(np.fft.fftfreq(self.n_fft, d=1.0 / self.fs))
 
-    def add_frame(self, csi_frame: np.ndarray, timestamp_s: float, band: Optional[int] = None):
+    def add_frame(
+        self,
+        csi_frame: np.ndarray,
+        timestamp_s: float,
+        band: Optional[int] = None,
+        rssi: Optional[Tuple[int, ...]] = None,
+        foe: Optional[int] = None,
+    ):
         """
         csi_frame shape: (N_rx, N_sc) complex64, typically (4, 64)
-        Computes conjugate ratio between Antenna 0 and Antenna 1, applies phase sanitization.
+        Computes conjugate ratio diversity across antennas, applies phase sanitization,
+        and computes 4-antenna spatial covariance matrix and FOE Doppler drift.
         """
         if band is not None:
             self.update_band(band)
 
         with self._lock:
+            # 4-Antenna Spatial Covariance Matrix R = E[(r - mu)(r - mu)^T]
+            if rssi is not None:
+                rssi_arr = np.asarray(rssi, dtype=np.float32)
+                if rssi_arr.size >= 4:
+                    self.rssi_buffer.append(rssi_arr[:4])
+                    if len(self.rssi_buffer) >= 8:
+                        cov = np.cov(np.array(self.rssi_buffer), rowvar=False)
+                        self.last_spatial_cov = cov
+                        eigvals = np.linalg.eigvalsh(cov)
+                        self.last_spatial_eigvals = eigvals
+                        self.last_spatial_trace = float(np.trace(cov))
+                        self.last_spatial_motion_power = float(eigvals[-1])
+
+            # Hardware FOE Doppler drift: delta_FOE = FOE - EMA(FOE)
+            if foe is not None:
+                val_foe = float(foe)
+                self.last_foe = val_foe
+                self.foe_buffer.append(val_foe)
+                if self.foe_ema is None:
+                    self.foe_ema = val_foe
+                else:
+                    self.foe_ema = self.foe_ema_alpha * val_foe + (1.0 - self.foe_ema_alpha) * self.foe_ema
+                drift = val_foe - self.foe_ema
+                self.last_foe_drift = drift
+                self.foe_drift_buffer.append(drift)
+                if len(self.foe_drift_buffer) >= 8:
+                    self.last_foe_drift_var = float(np.var(self.foe_drift_buffer))
+
             if self.t0 is None:
                 self.t0 = timestamp_s
 
@@ -417,42 +502,79 @@ class MicroDopplerProcessor:
                 # Preserve monotonic non-decreasing timestamp axis under jitter
                 rel_t = self.timestamps[-1]
 
-            # Optional subcarrier pre-filtering (Hampel/Median) across tones
-            if (ENABLE_SUBCARRIER_PREFILTER and self.use_subcarrier_prefilter) and csi_frame is not None:
-                csi_frame = prefilter_subcarriers(csi_frame, method=PHASE_FILTER_METHOD)
+            # Check if genuine OFDM subcarrier data is present
+            is_cfr_active = csi_frame is not None and bool(np.any(np.abs(csi_frame) > 0))
+            self.is_raw_cfr = is_cfr_active
 
-            # Antenna conjugate cross-correlation or single-antenna fallback
-            if (self.single_antenna or ENABLE_SINGLE_ANTENNA) and csi_frame is not None:
-                if np.asarray(csi_frame).ndim >= 2 and csi_frame.shape[0] >= 1:
-                    csi_ratio = np.asarray(csi_frame[0], dtype=np.complex64)
+            if is_cfr_active:
+                # Optional subcarrier pre-filtering (Hampel/Median) across tones
+                if (ENABLE_SUBCARRIER_PREFILTER and self.use_subcarrier_prefilter) and csi_frame is not None:
+                    csi_frame = prefilter_subcarriers(csi_frame, method=PHASE_FILTER_METHOD)
+
+                # Multi-antenna ratio diversity or single-antenna fallback
+                if (self.single_antenna or ENABLE_SINGLE_ANTENNA) and csi_frame is not None:
+                    if np.asarray(csi_frame).ndim >= 2 and csi_frame.shape[0] >= 1:
+                        csi_ratio = np.asarray(csi_frame[0], dtype=np.complex64)
+                    else:
+                        csi_ratio = np.asarray(csi_frame, dtype=np.complex64)
+                    if ENABLE_PHASE_FILTERING:
+                        csi_ratio = _sanitize_phase_1d(csi_ratio)
+                elif csi_frame is not None:
+                    csi_ratio = compute_multi_antenna_ratio(csi_frame, method="correlation")
+                    if ENABLE_PHASE_FILTERING:
+                        csi_ratio = _sanitize_phase_1d(csi_ratio)
                 else:
-                    csi_ratio = np.asarray(csi_frame, dtype=np.complex64)
-                if ENABLE_PHASE_FILTERING:
-                    csi_ratio = _sanitize_phase_1d(csi_ratio)
-            elif csi_frame is not None and np.asarray(csi_frame).ndim >= 2 and csi_frame.shape[0] >= 2:
-                h0 = csi_frame[0]
-                h1 = csi_frame[1]
-                csi_ratio = compute_csi_ratio(h0, h1, method="correlation")
-            elif csi_frame is not None and np.asarray(csi_frame).ndim == 1:
-                csi_ratio = np.asarray(csi_frame, dtype=np.complex64)
-                if ENABLE_PHASE_FILTERING:
-                    csi_ratio = _sanitize_phase_1d(csi_ratio)
-            else:
-                csi_ratio = np.zeros(64, dtype=np.complex64)
+                    csi_ratio = np.zeros(64, dtype=np.complex64)
 
-            # Apply static clutter filter across time
-            dynamic_ratio = self.clutter_filter.filter(csi_ratio)
-            self.sc_buffer.append(np.copy(dynamic_ratio))
+                # Apply static clutter filter across time
+                dynamic_ratio = self.clutter_filter.filter(csi_ratio)
+                self.sc_buffer.append(np.copy(dynamic_ratio))
 
-            # Aggregate across active subcarriers (e.g. 4:60 for 20 MHz HT with 56 usable subcarriers)
-            if len(dynamic_ratio) > 8:
-                sc_start = min(4, len(dynamic_ratio) // 8)
-                sc_end = max(sc_start + 1, len(dynamic_ratio) - sc_start)
-                agg_val = np.mean(dynamic_ratio[sc_start:sc_end])
-            elif len(dynamic_ratio) > 0:
-                agg_val = np.mean(dynamic_ratio)
+                # Aggregate across active subcarriers (e.g. 4:60 for 20 MHz HT with 56 usable subcarriers)
+                if len(dynamic_ratio) > 8:
+                    sc_start = min(4, len(dynamic_ratio) // 8)
+                    sc_end = max(sc_start + 1, len(dynamic_ratio) - sc_start)
+                    agg_val = np.mean(dynamic_ratio[sc_start:sc_end])
+                elif len(dynamic_ratio) > 0:
+                    agg_val = np.mean(dynamic_ratio)
+                else:
+                    agg_val = 0.0 + 0.0j
             else:
-                agg_val = 0.0 + 0.0j
+                # Genuine MT7615 4-Antenna RF Doppler & Spatial Diversity
+                dt = (rel_t - self.timestamps[-1]) if self.timestamps else (1.0 / self.fs)
+                if dt <= 0.0 or dt > 0.5:
+                    dt = 1.0 / self.fs
+
+                r0 = float(rssi[0]) if rssi and len(rssi) > 0 else -50.0
+                r1 = float(rssi[1]) if rssi and len(rssi) > 1 else -50.0
+                r2 = float(rssi[2]) if rssi and len(rssi) > 2 else -50.0
+                r3 = float(rssi[3]) if rssi and len(rssi) > 3 else -50.0
+
+                self.rf_rssi_history.append((r0, r1, r2, r3))
+
+                # Spatial differential fading across antenna pairs (cancels common-mode power variations)
+                diff_01 = r0 - r1
+                diff_23 = r2 - r3
+                self.rf_diff01_buffer.append(diff_01)
+                self.rf_diff23_buffer.append(diff_23)
+                self.rf_foe_drift_buffer.append(self.last_foe_drift)
+
+                # Integrated phase from physical baseband FOE Doppler drift
+                self.foe_integrated_phase += 2.0 * math.pi * self.last_foe_drift * dt
+                # Keep phase bounded in [-pi, pi]
+                if self.foe_integrated_phase > math.pi or self.foe_integrated_phase < -math.pi:
+                    self.foe_integrated_phase = math.atan2(math.sin(self.foe_integrated_phase), math.cos(self.foe_integrated_phase))
+
+                # Composite Analytic RF Doppler Signal:
+                # Envelope carries 4-antenna spatial diversity fading, carrier carries baseband Doppler drift
+                rot = np.exp(1j * self.foe_integrated_phase)
+                rf_analytic = (diff_01 + 1j * diff_23) * rot
+
+                # Broadcast across 64 channels so downstream STFT & PCA work smoothly
+                rf_vector = np.full(64, rf_analytic, dtype=np.complex64)
+                dynamic_ratio = self.clutter_filter.filter(rf_vector)
+                self.sc_buffer.append(np.copy(dynamic_ratio))
+                agg_val = dynamic_ratio[0]
 
             if np.isnan(agg_val) or np.isinf(agg_val):
                 agg_val = 0.0 + 0.0j
@@ -640,6 +762,7 @@ class MockCSIGenerator:
             i_data=i_data,
             q_data=q_data,
             csi_complex=csi_complex,
+            foe=int(doppler_freq * 10),
         )
 
 
@@ -665,6 +788,7 @@ class CSIPlaybackReader:
         self.rssi = data["rssi"]
         self.noise_floor = data["noise_floor"]
         self.src_mac = data["src_mac"]
+        self.foe = data["foe"] if "foe" in data else None
         self.csi = data["csi"]
         self.i_data = data["i_data"]
         self.q_data = data["q_data"]
@@ -685,6 +809,7 @@ class CSIPlaybackReader:
 
         mac_val = self.src_mac[idx]
         mac_str = str(mac_val) if isinstance(mac_val, (str, np.str_)) else "00:00:00:00:00:00"
+        foe_val = int(self.foe[idx]) if self.foe is not None else 0
 
         return CSIPacket(
             timestamp_us=int(self.timestamps_us[idx]),
@@ -702,6 +827,7 @@ class CSIPlaybackReader:
             i_data=self.i_data[idx],
             q_data=self.q_data[idx],
             csi_complex=self.csi[idx],
+            foe=foe_val,
         )
 
 
@@ -817,7 +943,13 @@ class MicroDopplerApp:
                 if self.logger:
                     self.logger.append(pkt)
                 pkt_t_s = (pkt.timestamp_us / 1e6) if pkt.timestamp_us > 0 else time.monotonic()
-                self.processor.add_frame(pkt.csi_complex, pkt_t_s, band=pkt.band)
+                self.processor.add_frame(
+                    pkt.csi_complex,
+                    pkt_t_s,
+                    band=pkt.band,
+                    rssi=pkt.rssi,
+                    foe=pkt.foe,
+                )
                 self.latest_packet = pkt
                 self.pkt_count += 1
                 self.interval_pkts += 1
@@ -866,6 +998,8 @@ class MicroDopplerApp:
         self.ax_amp.grid(True, linestyle="--", alpha=0.3)
         (self.line_amp0,) = self.ax_amp.plot([], [], label="Ant 0 (Rx0)", color="#00ffcc", lw=1.8, animated=self.use_blit)
         (self.line_amp1,) = self.ax_amp.plot([], [], label="Ant 1 (Rx1)", color="#ff007f", lw=1.8, animated=self.use_blit)
+        (self.line_amp2,) = self.ax_amp.plot([], [], label="Ant 2 (Rx2)", color="#ffff00", lw=1.5, animated=self.use_blit)
+        (self.line_amp3,) = self.ax_amp.plot([], [], label="Ant 3 (Rx3)", color="#33ff33", lw=1.5, animated=self.use_blit)
         self.ax_amp.legend(loc="upper right", fontsize=8)
 
         # Panel 2: Phase Sanitization & CSI Ratio
@@ -876,8 +1010,8 @@ class MicroDopplerApp:
         self.ax_phase.set_xlim(0, 63)
         self.ax_phase.set_ylim(-math.pi * 1.5, math.pi * 1.5)
         self.ax_phase.grid(True, linestyle="--", alpha=0.3)
-        (self.line_raw_phase,) = self.ax_phase.plot([], [], label="Raw Ratio Phase", color="#888888", lw=1.2, ls=":", animated=self.use_blit)
-        (self.line_clean_phase,) = self.ax_phase.plot([], [], label="Sanitized Ratio Phase", color="#ffff00", lw=2.0, animated=self.use_blit)
+        (self.line_raw_phase,) = self.ax_phase.plot([], [], label="FOE Drift / 10 (Hz)", color="#00aaee", lw=1.2, ls=":", animated=self.use_blit)
+        (self.line_clean_phase,) = self.ax_phase.plot([], [], label="Diff Fading Rx0-Rx1 (dB)", color="#ffff00", lw=2.0, animated=self.use_blit)
         self.ax_phase.legend(loc="upper right", fontsize=8)
 
         # Panel 3: Micro-Doppler Spectrogram (spans full width bottom)
@@ -951,56 +1085,87 @@ class MicroDopplerApp:
                 self.ax_vel.set_ylim(-v_max, v_max)
                 needs_redraw = True
 
-            if (self.single_antenna or ENABLE_SINGLE_ANTENNA) and pkt.csi_complex is not None:
-                # Single-antenna fallback visualization
-                h0 = pkt.csi_complex[0] if np.asarray(pkt.csi_complex).ndim >= 2 else pkt.csi_complex
-                amp0 = np.abs(h0)
-                x_sc = np.arange(len(amp0))
+            if self.processor.is_raw_cfr:
+                # Subcarrier OFDM CFR mode (when raw subcarriers are present)
+                if (self.single_antenna or ENABLE_SINGLE_ANTENNA) and pkt.csi_complex is not None:
+                    h0 = pkt.csi_complex[0] if np.asarray(pkt.csi_complex).ndim >= 2 else pkt.csi_complex
+                    amp0 = np.abs(h0)
+                    x_sc = np.arange(len(amp0))
 
-                self.line_amp0.set_data(x_sc, amp0)
-                self.line_amp1.set_data([], [])
+                    self.line_amp0.set_data(x_sc, amp0)
+                    self.line_amp1.set_data([], [])
+                    self.line_amp2.set_data([], [])
+                    self.line_amp3.set_data([], [])
 
-                if len(amp0) > 0:
-                    max_amp = max(float(np.max(amp0)), 10.0)
-                    if max_amp > self._current_amp_ylim * 0.95 or max_amp < self._current_amp_ylim * 0.25:
-                        self._current_amp_ylim = max(float(max_amp * 1.5), 50.0)
-                        self.ax_amp.set_ylim(0, self._current_amp_ylim)
+                    if len(amp0) > 0:
+                        max_amp = max(float(np.max(amp0)), 10.0)
+                        if max_amp > self._current_amp_ylim * 0.95 or max_amp < self._current_amp_ylim * 0.25:
+                            self._current_amp_ylim = max(float(max_amp * 1.5), 50.0)
+                            self.ax_amp.set_ylim(0, self._current_amp_ylim)
+                            needs_redraw = True
+
+                    raw_phase = np.angle(h0)
+                    sanitized = _sanitize_phase_1d(h0)
+                    clean_phase = np.angle(sanitized)
+
+                    self.line_raw_phase.set_data(x_sc, raw_phase)
+                    self.line_clean_phase.set_data(x_sc, clean_phase)
+                elif pkt.csi_complex is not None and np.asarray(pkt.csi_complex).ndim >= 2 and pkt.csi_complex.shape[0] >= 2:
+                    h0 = pkt.csi_complex[0]
+                    h1 = pkt.csi_complex[1]
+
+                    amp0 = np.abs(h0)
+                    amp1 = np.abs(h1)
+                    x_sc = np.arange(len(amp0))
+
+                    self.line_amp0.set_data(x_sc, amp0)
+                    self.line_amp1.set_data(x_sc, amp1)
+                    self.line_amp2.set_data([], [])
+                    self.line_amp3.set_data([], [])
+
+                    if len(amp0) > 0 and len(amp1) > 0:
+                        max_amp = max(float(np.max(amp0)), float(np.max(amp1)), 10.0)
+                        if max_amp > self._current_amp_ylim * 0.95 or max_amp < self._current_amp_ylim * 0.25:
+                            self._current_amp_ylim = max(float(max_amp * 1.5), 50.0)
+                            self.ax_amp.set_ylim(0, self._current_amp_ylim)
+                            needs_redraw = True
+
+                    csi_ratio = compute_csi_ratio(h0, h1)
+                    raw_ratio_phase = np.angle(csi_ratio)
+                    sanitized_ratio = _sanitize_phase_1d(csi_ratio)
+                    clean_phase = np.angle(sanitized_ratio)
+
+                    self.line_raw_phase.set_data(x_sc, raw_ratio_phase)
+                    self.line_clean_phase.set_data(x_sc, clean_phase)
+            else:
+                # Genuine MT7615 4-Antenna RF Doppler & Spatial Diversity Mode
+                rssi_hist = np.array(self.processor.rf_rssi_history)
+                if len(rssi_hist) > 0:
+                    x_pts = np.arange(len(rssi_hist))
+                    self.line_amp0.set_data(x_pts, rssi_hist[:, 0])
+                    self.line_amp1.set_data(x_pts, rssi_hist[:, 1])
+                    self.line_amp2.set_data(x_pts, rssi_hist[:, 2])
+                    self.line_amp3.set_data(x_pts, rssi_hist[:, 3])
+
+                    self.ax_amp.set_xlim(0, max(len(rssi_hist), 10))
+                    min_rssi = float(np.min(rssi_hist)) - 6.0
+                    max_rssi = float(np.max(rssi_hist)) + 6.0
+                    cur_ylim = self.ax_amp.get_ylim()
+                    if min_rssi < cur_ylim[0] or max_rssi > cur_ylim[1] or cur_ylim[0] >= 0:
+                        self.ax_amp.set_ylim(min_rssi, max_rssi)
                         needs_redraw = True
 
-                raw_phase = np.angle(h0)
-                sanitized = _sanitize_phase_1d(h0)
-                clean_phase = np.angle(sanitized)
-
-                self.line_raw_phase.set_data(x_sc, raw_phase)
-                self.line_clean_phase.set_data(x_sc, clean_phase)
-            elif pkt.csi_complex is not None and np.asarray(pkt.csi_complex).ndim >= 2 and pkt.csi_complex.shape[0] >= 2:
-                h0 = pkt.csi_complex[0]
-                h1 = pkt.csi_complex[1]
-
-                # Subcarrier amplitudes
-                amp0 = np.abs(h0)
-                amp1 = np.abs(h1)
-                x_sc = np.arange(len(amp0))
-
-                self.line_amp0.set_data(x_sc, amp0)
-                self.line_amp1.set_data(x_sc, amp1)
-
-                # Amplitude headroom with hysteresis (avoids dirtying axis limits on typical frames)
-                if len(amp0) > 0 and len(amp1) > 0:
-                    max_amp = max(float(np.max(amp0)), float(np.max(amp1)), 10.0)
-                    if max_amp > self._current_amp_ylim * 0.95 or max_amp < self._current_amp_ylim * 0.25:
-                        self._current_amp_ylim = max(float(max_amp * 1.5), 50.0)
-                        self.ax_amp.set_ylim(0, self._current_amp_ylim)
+                diff_hist = np.array(self.processor.rf_diff01_buffer)
+                foe_hist = np.array(self.processor.rf_foe_drift_buffer)
+                if len(diff_hist) > 0 and len(foe_hist) > 0:
+                    x_pts = np.arange(len(diff_hist))
+                    self.line_clean_phase.set_data(x_pts, diff_hist)
+                    self.line_raw_phase.set_data(x_pts, foe_hist / 10.0)
+                    self.ax_phase.set_xlim(0, max(len(diff_hist), 10))
+                    cur_ylim = self.ax_phase.get_ylim()
+                    if cur_ylim != (-15.0, 15.0):
+                        self.ax_phase.set_ylim(-15.0, 15.0)
                         needs_redraw = True
-
-                # Ratio & Sanitized Phase
-                csi_ratio = compute_csi_ratio(h0, h1)
-                raw_ratio_phase = np.angle(csi_ratio)
-                sanitized_ratio = _sanitize_phase_1d(csi_ratio)
-                clean_phase = np.angle(sanitized_ratio)
-
-                self.line_raw_phase.set_data(x_sc, raw_ratio_phase)
-                self.line_clean_phase.set_data(x_sc, clean_phase)
 
         # 2. Update Panel 3: Spectrogram (fast rolling buffer update only when new STFT slice has arrived)
         curr_slice_count = getattr(self.processor, "slice_counter", len(self.processor.spec_history))
@@ -1021,7 +1186,8 @@ class MicroDopplerApp:
                     self.spec_buffer[:, -k + idx] = s_arr
                 elif len(s_arr) > 0:
                     x_old = np.linspace(-self.processor.doppler_limit_hz, self.processor.doppler_limit_hz, len(s_arr))
-                    self.spec_buffer[:, -k + idx] = np.interp(self.processor.freq_bins, x_old, s_arr)
+                    x_new = np.linspace(-self.processor.doppler_limit_hz, self.processor.doppler_limit_hz, target_rows)
+                    self.spec_buffer[:, -k + idx] = np.interp(x_new, x_old, s_arr)
 
             self.im_spec.set_data(self.spec_buffer)
             self._last_rendered_slice_count = curr_slice_count
@@ -1044,11 +1210,11 @@ class MicroDopplerApp:
         dop = self.processor.peak_doppler_hz
         rssi_str = ""
         if self.latest_packet:
-            rssi_str = f" | RSSI: {self.latest_packet.rssi[:2]}"
+            rssi_str = f" | Rx: [{self.latest_packet.rssi[0]}, {self.latest_packet.rssi[1]}, {self.latest_packet.rssi[2]}, {self.latest_packet.rssi[3]}] dBm"
 
         status = (
-            f"Rate: {self.current_rate_hz:5.1f} Hz | Total: {self.pkt_count:6d} pkts"
-            f"{rssi_str} | Peak Doppler: {dop:+5.1f} Hz | Est Velocity: {vel:+5.2f} m/s"
+            f"Rate: {self.current_rate_hz:5.1f} Hz | Pkts: {self.pkt_count:6d}"
+            f"{rssi_str} | FOE Drift: {self.processor.last_foe_drift:+4.1f} Hz | Tr(Cov): {self.processor.last_spatial_trace:4.2f} | Est Vel: {vel:+5.2f} m/s"
         )
         if status != self._last_status_str:
             self.status_text.set_text(status)
@@ -1060,6 +1226,8 @@ class MicroDopplerApp:
         return (
             self.line_amp0,
             self.line_amp1,
+            self.line_amp2,
+            self.line_amp3,
             self.line_raw_phase,
             self.line_clean_phase,
             self.im_spec,

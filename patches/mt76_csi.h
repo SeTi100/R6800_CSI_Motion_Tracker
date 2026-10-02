@@ -9,6 +9,7 @@
 #ifndef __MT76_CSI_H
 #define __MT76_CSI_H
 
+#include <linux/version.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
@@ -51,7 +52,7 @@ struct mt76_csi_data {
 
 	/* Source identification */
 	u8  src_mac[6];                /* Sender MAC address */
-	u8  _pad1[2];
+	s16 foe;                       /* Frequency Offset Estimation */
 
 	/* I/Q Data: [antenna][subcarrier]
 	 * For 2x2 @ 20MHz: 2 * 56 * 2 * 2 = 448 bytes

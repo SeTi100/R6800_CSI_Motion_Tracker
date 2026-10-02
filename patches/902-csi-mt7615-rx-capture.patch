@@ -26,7 +26,7 @@
  
 --- a/mt7615/mac.c
 +++ b/mt7615/mac.c
-@@ -576,6 +576,90 @@
+@@ -576,6 +576,72 @@
  
  		mt7615_mac_fill_tm_rx(mphy->priv, rxd);
  
@@ -38,7 +38,6 @@
 +			struct ieee80211_sta *sta = wcid_to_sta(status->wcid);
 +			u32 rxdg5 = le32_to_cpu(rxd[5]);
 +			s16 foe_val;
-+			int ant, sc;
 +
 +			if (sta) {
 +				memcpy(src_mac, sta->addr, ETH_ALEN);
@@ -80,6 +79,7 @@
 +				foe_val = (s16)FIELD_GET(MT_RXV5_FOE, le32_to_cpu(rxd[4]));
 +				if (foe_val & BIT(11))
 +					foe_val -= 4096;
++				csi_rec->foe = foe_val;
 +
 +				/* Hardware RX status vector (Group 3) contains only scalar PHY metrics
 +				 * (RSSI, RCPI, FOE, Noise Floor). Synthetic sine/cosine pseudo-CSI has been
@@ -99,7 +99,7 @@
  		rxd += 6;
  		if ((u8 *)rxd - skb->data >= skb->len)
  			return -EINVAL;
-@@ -1637,6 +1721,18 @@
+@@ -1637,6 +1704,18 @@
  		mt7615_mac_tx_free(dev, skb->data, skb->len);
  		dev_kfree_skb(skb);
  		break;

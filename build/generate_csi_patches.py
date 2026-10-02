@@ -12,20 +12,21 @@ import shutil
 import difflib
 import subprocess
 
+OPENWRT_DIR = os.environ.get('OPENWRT_DIR', os.path.expanduser('~/openwrt'))
 CLEAN_DIR = '/tmp/mt76-clean/mt76-2026.03.19~39c960c3'
 WORK_DIR = '/tmp/mt76-patch-build'
 PATCH_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'patches'))
 
 # Add host toolchain tools
-os.environ['PATH'] = '/home/nos/openwrt/staging_dir/host/bin:' + os.environ.get('PATH', '')
+os.environ['PATH'] = f"{OPENWRT_DIR}/staging_dir/host/bin:" + os.environ.get('PATH', '')
 
 if not os.path.exists(CLEAN_DIR):
     os.makedirs('/tmp/mt76-clean', exist_ok=True)
     subprocess.run([
         'tar',
-        '--use-compress-program=/home/nos/openwrt/staging_dir/host/bin/zstd',
+        '--zstd',
         '-xf',
-        '/home/nos/openwrt/dl/mt76-2026.03.19~39c960c3.tar.zst',
+        f"{OPENWRT_DIR}/dl/mt76-2026.03.19~39c960c3.tar.zst",
         '-C',
         '/tmp/mt76-clean'
     ], check=True)
@@ -309,6 +310,7 @@ new_fill = '''\t\tmt7615_mac_fill_tm_rx(mphy->priv, rxd);
 \t\t\t\tfoe_val = (s16)FIELD_GET(MT_RXV5_FOE, le32_to_cpu(rxd[4]));
 \t\t\t\tif (foe_val & BIT(11))
 \t\t\t\t\tfoe_val -= 4096;
+\t\t\t\tcsi_rec->foe = foe_val;
 
 \t\t\t\t/* Hardware RX status vector (Group 3) contains only scalar PHY metrics
 \t\t\t\t * (RSSI, RCPI, FOE, Noise Floor). Synthetic sine/cosine pseudo-CSI has been

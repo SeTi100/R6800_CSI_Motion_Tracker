@@ -33,9 +33,9 @@ import numpy as np
 #   noise_floor:   B (1 byte, uint8)
 #   _pad0:         B (1 byte, uint8)
 #   src_mac:       6s (6 bytes, raw MAC)
-#   _pad1:         2B (2 bytes)
+#   foe:           h (2 bytes, int16 signed Frequency Offset Estimation)
 # Total Header = 34 bytes
-CSI_HEADER_FORMAT = "<QIH6B4b2B6s2B"
+CSI_HEADER_FORMAT = "<QIH6B4b2B6sh"
 CSI_HEADER_SIZE = 34
 CSI_PAYLOAD_SIZE = 1058
 CSI_IQ_POINTS = 4 * 64  # 4 antennas x 64 subcarriers = 256 points
@@ -65,6 +65,7 @@ class CSIPacket:
         "rssi",
         "noise_floor",
         "src_mac",
+        "foe",
         "i_data",
         "q_data",
         "csi_complex",
@@ -87,6 +88,7 @@ class CSIPacket:
         i_data: np.ndarray,
         q_data: np.ndarray,
         csi_complex: np.ndarray,
+        foe: int = 0,
     ):
         self.timestamp_us = timestamp_us
         self.seq_num = seq_num
@@ -100,6 +102,7 @@ class CSIPacket:
         self.rssi = rssi
         self.noise_floor = noise_floor
         self.src_mac = src_mac
+        self.foe = foe
         self.i_data = i_data
         self.q_data = q_data
         self.csi_complex = csi_complex
@@ -129,8 +132,7 @@ class CSIPacket:
             nf,
             _p0,
             raw_mac,
-            _p1,
-            _p2,
+            foe,
         ) = header_vals
 
         mac_str = format_mac(raw_mac)
@@ -159,6 +161,7 @@ class CSIPacket:
             i_data=i_raw,
             q_data=q_raw,
             csi_complex=csi_complex,
+            foe=foe,
         )
 
 
@@ -321,6 +324,7 @@ class CSIDataLogger:
         self.rssi: List[Tuple[int, int, int, int]] = []
         self.noise_floor: List[int] = []
         self.src_macs: List[str] = []
+        self.foe: List[int] = []
         self.i_records: List[np.ndarray] = []
         self.q_records: List[np.ndarray] = []
 
@@ -338,6 +342,7 @@ class CSIDataLogger:
         self.rssi.append(pkt.rssi)
         self.noise_floor.append(pkt.noise_floor)
         self.src_macs.append(pkt.src_mac)
+        self.foe.append(pkt.foe)
         self.i_records.append(pkt.i_data)
         self.q_records.append(pkt.q_data)
 
@@ -364,6 +369,7 @@ class CSIDataLogger:
         rssi = np.array(self.rssi, dtype=np.int8)
         noise_floor = np.array(self.noise_floor, dtype=np.uint8)
         src_macs = np.array(self.src_macs)
+        foe_array = np.array(self.foe, dtype=np.int16)
 
         i_array = np.stack(self.i_records, axis=0)  # Shape (N, 4, 64)
         q_array = np.stack(self.q_records, axis=0)  # Shape (N, 4, 64)
@@ -383,6 +389,7 @@ class CSIDataLogger:
             rssi=rssi,
             noise_floor=noise_floor,
             src_mac=src_macs,
+            foe=foe_array,
             i_data=i_array,
             q_data=q_array,
             csi=csi_complex,

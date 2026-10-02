@@ -55,7 +55,7 @@ struct mt76_csi_data {
 
 	/* Source identification */
 	uint8_t  src_mac[6];                /* Transmitter MAC address */
-	uint8_t  _pad1[2];
+	int16_t  foe;                       /* Frequency Offset Estimation */
 
 	/* I/Q Data: [antenna][subcarrier] */
 	int16_t  i_data[MT76_CSI_MAX_ANTENNAS][MT76_CSI_MAX_SUBCARRIERS];

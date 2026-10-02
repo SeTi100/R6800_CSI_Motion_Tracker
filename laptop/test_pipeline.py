@@ -71,15 +71,14 @@ class TestCSIPipeline(unittest.TestCase):
         nf = 85
         pad0 = 0
         mac = b"\x08\x02\x8e\xde\x23\x76"
-        pad1_0 = 0
-        pad1_1 = 0
+        foe = 120
 
         header_bytes = struct.pack(
             CSI_HEADER_FORMAT,
             ts, seq, frame_seq,
             band, bw, ch, n_rx, n_tx, n_sc,
             rssi[0], rssi[1], rssi[2], rssi[3],
-            nf, pad0, mac, pad1_0, pad1_1
+            nf, pad0, mac, foe
         )
         self.assertEqual(len(header_bytes), 34)
 
@@ -104,6 +103,7 @@ class TestCSIPipeline(unittest.TestCase):
         self.assertEqual(pkt.rssi, rssi)
         self.assertEqual(pkt.noise_floor, nf)
         self.assertEqual(pkt.src_mac, "08:02:8e:de:23:76")
+        self.assertEqual(pkt.foe, foe)
 
         # Check CSI complex matrix
         self.assertEqual(pkt.csi_complex.shape, (4, 64))
@@ -131,7 +131,7 @@ class TestCSIPipeline(unittest.TestCase):
                 pkt.timestamp_us, pkt.seq_num, pkt.frame_seq,
                 pkt.band, pkt.bw, pkt.channel, pkt.n_rx, pkt.n_tx, pkt.n_subcarriers,
                 pkt.rssi[0], pkt.rssi[1], pkt.rssi[2], pkt.rssi[3],
-                pkt.noise_floor, 0, mac_bytes, 0, 0
+                pkt.noise_floor, 0, mac_bytes, getattr(pkt, "foe", 0)
             )
             raw = header + pkt.i_data.tobytes() + pkt.q_data.tobytes()
             sender.sendto(raw, ("127.0.0.1", test_port))
@@ -312,7 +312,7 @@ class TestCSIPipeline(unittest.TestCase):
                 pkt.timestamp_us, pkt.seq_num, pkt.frame_seq,
                 pkt.band, pkt.bw, pkt.channel, pkt.n_rx, pkt.n_tx, pkt.n_subcarriers,
                 pkt.rssi[0], pkt.rssi[1], pkt.rssi[2], pkt.rssi[3],
-                pkt.noise_floor, 0, mac_bytes, 0, 0
+                pkt.noise_floor, 0, mac_bytes, getattr(pkt, "foe", 0)
             )
             return header + pkt.i_data.tobytes() + pkt.q_data.tobytes()
 
@@ -1038,6 +1038,79 @@ class TestCSIPipeline(unittest.TestCase):
         self.assertEqual(probes_sent, 3)
         self.assertEqual(len(commands_run), 3)
         self.assertIn("5180", commands_run[0])
+
+
+    def test_32_genuine_rf_doppler_and_spatial_diversity(self):
+        """Verify genuine 4-antenna RF Doppler & spatial covariance processing when subcarrier CFR is zero."""
+        from csi_doppler_V2 import MicroDopplerProcessor, CSIPacket, MicroDopplerApp
+        import numpy as np
+
+        # Initialize processor
+        proc = MicroDopplerProcessor(
+            window_size=128, step_size=8, n_fft=256, sampling_rate=200.0, use_pca=True
+        )
+
+        # Feed 150 frames with zero subcarriers (genuine MT7615 baseband capture)
+        # but with simulated human walking motion causing differential antenna fading and FOE Doppler drift
+        t_now = 0.0
+        dt = 1.0 / 200.0
+        for i in range(160):
+            t_now += dt
+            # Walking Doppler modulation: ~15 Hz Doppler shift on FOE
+            doppler_hz = 15.0 * np.sin(2 * np.pi * 1.5 * t_now)
+            foe_val = int(450 + doppler_hz)
+
+            # Spatial differential fading between antennas due to multipath
+            r0 = -20.0 + 3.0 * np.sin(2 * np.pi * 1.5 * t_now)
+            r1 = -15.0 - 2.0 * np.sin(2 * np.pi * 1.5 * t_now)
+            r2 = -18.0 + 1.5 * np.cos(2 * np.pi * 1.5 * t_now)
+            r3 = -25.0 - 1.0 * np.cos(2 * np.pi * 1.5 * t_now)
+            rssi = (int(r0), int(r1), int(r2), int(r3))
+
+            # Zero CFR matrix
+            zero_csi = np.zeros((4, 64), dtype=np.complex64)
+            proc.add_frame(zero_csi, t_now, band=1, rssi=rssi, foe=foe_val)
+
+        # 1. Verify that processor recognized RF Doppler mode
+        self.assertFalse(proc.is_raw_cfr)
+        self.assertGreater(len(proc.rf_rssi_history), 0)
+        self.assertGreater(len(proc.rf_diff01_buffer), 0)
+        self.assertGreater(proc.last_spatial_trace, 0.0)
+
+        # 2. Verify spectrogram generation from genuine RF Doppler signal
+        spec, t_axis, v_axis = proc.get_spectrogram_matrix()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.shape[0], len(proc.freq_bins))
+        self.assertGreater(spec.shape[1], 1)
+        # Power should be non-trivial (not flat -120 dB)
+        self.assertGreater(np.max(spec), -80.0)
+
+        # 3. Verify MicroDopplerApp UI update with 4-antenna data
+        app = MicroDopplerApp(source_mode="mock", num_doppler_bins=proc.num_bins, use_blit=False)
+        app.processor = proc
+        app.latest_packet = CSIPacket(
+            timestamp_us=int(t_now * 1e6),
+            seq_num=160,
+            frame_seq=160,
+            band=1,
+            bw=0,
+            channel=36,
+            n_rx=4,
+            n_tx=1,
+            n_subcarriers=64,
+            rssi=(-20, -15, -18, -25),
+            noise_floor=80,
+            src_mac="44:a5:6e:70:e5:8b",
+            i_data=np.zeros((4, 64), dtype=np.int16),
+            q_data=np.zeros((4, 64), dtype=np.int16),
+            csi_complex=np.zeros((4, 64), dtype=np.complex64),
+            foe=450,
+        )
+        artists = app._update_plot(0)
+        self.assertEqual(len(artists), 8)
+        self.assertIn("Rx: [", app.status_text.get_text())
+        self.assertIn("Tr(Cov):", app.status_text.get_text())
+        self.assertIn("FOE Drift:", app.status_text.get_text())
 
 
 if __name__ == "__main__":
