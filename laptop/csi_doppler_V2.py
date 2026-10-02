@@ -854,6 +854,7 @@ class MicroDopplerApp:
         target_heading_deg: float = 0.0,
         use_pca: bool = True,
         record_file: Optional[str] = None,
+        mac_filter: Optional[str] = "44:a5:6e:70:e5:8b",
     ):
         self.source_mode = source_mode
         self.port = port
@@ -870,6 +871,7 @@ class MicroDopplerApp:
         self.target_heading_deg = float(target_heading_deg)
         self.use_pca = use_pca
         self.record_file = record_file
+        self.mac_filter = mac_filter.lower().strip() if (mac_filter and mac_filter.lower() != "all") else None
         self.logger = CSIDataLogger(filename=record_file) if record_file and CSIDataLogger else None
 
         self.running = True
@@ -940,6 +942,9 @@ class MicroDopplerApp:
                 pkt = file_reader.get_next_packet()
 
             if pkt is not None:
+                if self.mac_filter and hasattr(pkt, "src_mac") and pkt.src_mac:
+                    if str(pkt.src_mac).lower() != self.mac_filter:
+                        continue
                 if self.logger:
                     self.logger.append(pkt)
                 pkt_t_s = (pkt.timestamp_us / 1e6) if pkt.timestamp_us > 0 else time.monotonic()
@@ -1139,6 +1144,16 @@ class MicroDopplerApp:
                     self.line_clean_phase.set_data(x_sc, clean_phase)
             else:
                 # Genuine MT7615 4-Antenna RF Doppler & Spatial Diversity Mode
+                if not getattr(self, "_rf_titles_set", False):
+                    self.ax_amp.set_title("4-Antenna RSSI Physical Diversity (Rx0..Rx3)", fontsize=11, fontweight="bold", pad=8)
+                    self.ax_amp.set_xlabel("Recent Packets", fontsize=9)
+                    self.ax_amp.set_ylabel("RSSI (dBm)", fontsize=9)
+                    self.ax_phase.set_title("Spatial Differential Fading (Rx0-Rx1) & FOE Drift", fontsize=11, fontweight="bold", pad=8)
+                    self.ax_phase.set_xlabel("Recent Packets", fontsize=9)
+                    self.ax_phase.set_ylabel("Diff Fading (dB) / Drift (Hz/10)", fontsize=9)
+                    self._rf_titles_set = True
+                    needs_redraw = True
+
                 rssi_hist = np.array(self.processor.rf_rssi_history)
                 if len(rssi_hist) > 0:
                     x_pts = np.arange(len(rssi_hist))
@@ -1275,6 +1290,7 @@ def main():
     parser.add_argument("--single-antenna", action="store_true", help="Fallback to single-antenna processing (Rx0)")
     parser.add_argument("--bistatic-angle", type=float, default=0.0, help="Bistatic angle beta in degrees (default: 0.0)")
     parser.add_argument("--target-heading", type=float, default=0.0, help="Target heading angle theta in degrees (default: 0.0)")
+    parser.add_argument("--mac", default="44:a5:6e:70:e5:8b", help="Target MAC address filter (default: 44:a5:6e:70:e5:8b, use 'all' for promiscuous)")
     parser.add_argument("--no-pca", action="store_true", help="Disable PCA subcarrier aggregation and use scalar mean")
 
     args = parser.parse_args()
@@ -1295,6 +1311,7 @@ def main():
         print(f"  Playback File:  {args.file} (speed: {args.speed}x)")
     elif mode == "mock":
         print("  Simulation:     Human walking & arm swing (+/- 1.4 m/s Doppler)")
+    print(f"  Target MAC:     {args.mac if args.mac != 'all' else 'All (Promiscuous)'}")
     if args.record:
         print(f"  Recording To:   {args.record}")
     if args.single_antenna:
@@ -1324,6 +1341,7 @@ def main():
         target_heading_deg=args.target_heading,
         use_pca=(not args.no_pca),
         record_file=args.record,
+        mac_filter=args.mac,
     )
     app.run()
 

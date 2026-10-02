@@ -79,6 +79,7 @@ def start_remote_extractor(
             return False
         parts = path.split("/")
         phy = parts[5] if len(parts) > 5 else "phy5"
+        client.exec_command(f"echo {DEFAULT_TARGET_MAC} > /sys/kernel/debug/ieee80211/{phy}/mt76/csi_filter_mac 2>/dev/null")
         cmd = f"/tmp/csi_extractor -i {phy} -d {laptop_ip} -p {port} -e > /tmp/csi_extractor.log 2>&1 &"
         client.exec_command(cmd)
         time.sleep(0.6)

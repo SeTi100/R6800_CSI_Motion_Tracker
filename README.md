@@ -182,6 +182,13 @@ Das Skript berechnet:
 * **Ursache:** Paramiko fehlt in der aktuell aktiven Python-Umgebung.
 * **Behebung:** `pip install paramiko` in deiner PowerShell ausführen.
 
+### Fehler 5: Regelmäßige Zacken / Einbrüche auf -90 dBm im RSSI-Verlauf
+* **Ursache:** Im 5-GHz-Band senden Nachbar-WLAN-Router auf Kanal 36 periodisch Beacons mit ca. -90 dBm (typisch alle 100 ms). Ohne MAC-Filterung vermischen sich die -90 dBm Beacons mit den -17 dBm Paketen des Testsenders (R6200) und überlagern jegliche Bewegung durch künstliche Rechteck-Sprünge.
+* **Behebung:**
+  1. **Hardware-Filter im Router:** `echo 44:a5:6e:70:e5:8b > /sys/kernel/debug/ieee80211/phy7/mt76/csi_filter_mac` (wird von `traffic_generator.py --start-extractor` automatisch gesetzt).
+  2. **Software-Filterung:** `laptop/csi_doppler_V2.py` und `laptop/analyze_csi_dataset.py` filtern standardmäßig nach `--mac 44:a5:6e:70:e5:8b`.
+  3. Bei gefilterten Daten ist die Stillstand-Baseline extrem ruhig ($\sigma \approx 0.18$ dB) und die Gehbewegung hebt sich mit $2.12\times$ bis $4.5\times$ dynamischer Fluktuationsenergie glasklar ab.
+
 ---
 
 ## 7. Automatisierte Tests
