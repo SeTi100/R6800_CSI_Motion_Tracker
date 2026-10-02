@@ -27,6 +27,34 @@ DEFAULT_R6800_IP = "192.168.10.1"
 DEFAULT_TARGET_MAC = "44:a5:6e:70:e5:8b"
 DEFAULT_SERIAL_PORT = "COM11"
 DEFAULT_SERIAL_BAUD = 57600
+DEFAULT_ROUTER_PASSWORD = "zanystreet862"
+
+
+def get_router_runner(
+    use_serial: bool = False,
+    serial_port: str = DEFAULT_SERIAL_PORT,
+    baud: int = DEFAULT_SERIAL_BAUD,
+    ip: str = DEFAULT_R6800_IP,
+    password: str = DEFAULT_ROUTER_PASSWORD,
+) -> Callable[[str, float], str]:
+    """Returns a command runner via SSH (preferred over Ethernet) or serial fallback."""
+    if not use_serial:
+        try:
+            import paramiko
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(ip, username="root", password=password, timeout=4)
+
+            def run_ssh(cmd: str, wait: float = 0.5) -> str:
+                stdin, stdout, stderr = client.exec_command(cmd)
+                return stdout.read().decode("utf-8", errors="replace")
+
+            return run_ssh
+        except Exception as e:
+            print(f"[*] SSH connection to {ip} not available ({e}); attempting serial...", file=sys.stderr)
+
+    from serial_cmd import run_serial
+    return run_serial
 
 
 class TrafficGenerator:
@@ -136,19 +164,18 @@ class TrafficGenerator:
         to elicit immediate Probe Responses from the R6200.
         """
         if serial_runner is None:
-            from serial_cmd import run_serial
-            serial_runner = run_serial
+            serial_runner = get_router_runner()
 
         probes_sent = 0
+        cmd = f"IFACE=$(iw dev | grep Interface | awk '{{print $2}}' | tail -1); [ -n \"$IFACE\" ] && iw dev $IFACE scan freq {freq_mhz} > /dev/null 2>&1"
         try:
             while True:
-                cmd = f"iw dev phy3-ap0 scan freq {freq_mhz} > /dev/null 2>&1"
                 try:
                     serial_runner(cmd, 0.5)
                 except Exception as e:
-                    print(f"[!] Serial error (is PuTTY open on COM11?): {e}", file=sys.stderr)
-                    print("[*] Tip: If PuTTY is open, you can run this command directly in PuTTY:", file=sys.stderr)
-                    print(f"    while true; do {cmd}; sleep 0.1; done &", file=sys.stderr)
+                    print(f"[!] Router command error: {e}", file=sys.stderr)
+                    print("[*] Tip: If using PuTTY on COM11, run this loop directly in PuTTY:", file=sys.stderr)
+                    print(f"    while true; do {cmd}; sleep 0.05; done &", file=sys.stderr)
                     break
                 probes_sent += 1
                 if not continuous and probes_sent >= count:
@@ -189,11 +216,15 @@ def main():
     parser.add_argument("--duration", type=float, default=None, help="Duration in seconds (default: infinite)")
     parser.add_argument("--continuous", action="store_true", help="Keep running continuously until Ctrl+C")
     parser.add_argument("--count", type=int, default=10, help="Number of bursts for probe mode (default: 10)")
+    parser.add_argument("--use-serial", action="store_true", help="Force serial COM port instead of SSH")
     parser.add_argument("--serial-port", default=DEFAULT_SERIAL_PORT, help="Serial COM port")
     parser.add_argument("--baud", type=int, default=DEFAULT_SERIAL_BAUD, help="Serial baud rate")
     args = parser.parse_args()
 
     gen = TrafficGenerator(target_ip=args.ip, target_port=args.port, rate_hz=args.rate)
+    runner = None
+    if args.mode in ("probe", "stats"):
+        runner = get_router_runner(use_serial=args.use_serial, serial_port=args.serial_port, baud=args.baud, ip=args.ip)
 
     if args.mode == "test-udp":
         target = args.ip if args.ip != DEFAULT_R6800_IP else "127.0.0.1"
@@ -209,18 +240,18 @@ def main():
 
     elif args.mode == "probe":
         print(f"[*] Triggering 802.11 active probe bursts on 5180 MHz (continuous={args.continuous})...")
-        sent = gen.generate_probe_burst(count=args.count, continuous=args.continuous)
+        sent = gen.generate_probe_burst(serial_runner=runner, count=args.count, continuous=args.continuous)
         print(f"[+] Complete. Triggered {sent} probe scan bursts.")
 
     elif args.mode == "stats":
-        print("[*] Monitoring router CSI capture rate over serial...")
-        from serial_cmd import run_serial
+        print("[*] Monitoring router CSI capture rate over SSH/serial...")
         prev_captured = None
         prev_time = time.time()
+        stats_cmd = "cat $(ls -d /sys/kernel/debug/ieee80211/phy*/mt76/csi_stats 2>/dev/null | tail -1)"
 
         try:
             while True:
-                out = run_serial("cat /sys/kernel/debug/ieee80211/phy3/mt76/csi_stats", 1.0)
+                out = runner(stats_cmd, 1.0)
                 stats = gen.parse_csi_stats(out)
                 now = time.time()
                 dt = now - prev_time
