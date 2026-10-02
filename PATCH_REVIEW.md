@@ -98,6 +98,9 @@ The modification strategy separates general ring-buffer and data structures (whi
     * Adds dispatching for `MCU_EXT_EVENT_CSI_REPORT` inside `mt7615_mcu_rx_ext_event()`.
     * Flags `rxd->ext_eid == MCU_EXT_EVENT_CSI_REPORT` in `mt7615_mcu_rx_event()` to treat incoming CSI frames as unsolicited asynchronous firmware notifications (preventing the MCU driver from interpreting them as replies to pending commands).
     * Implements `mt7615_mcu_set_csi()` which dispatches `MCU_EXT_CMD(CSI_CTRL)` to the Andes N9/CR4 coprocessor via `mt76_mcu_send_msg()`.
+* **Technical Audit & Limitations:**
+  * **Opcode 0xc2 Portability:** Opcode `0xc2` is MediaTek's `MCU_EXT_CMD_SPR_SET_PARAM` / CSI control command implemented for **MT7915 / Wi-Fi 6** chipsets. In MT7615 Andes N9 firmware (`mt7615_n9.bin`), opcode `0xc2` is not recognized and is rejected by firmware dispatch.
+  * Attempting to send `0xc2` to MT7615 Andes N9 produces command timeouts or firmware drop. Consequently, runtime CSI capture on MT7615 cannot rely on MT7915-style unsolicited MCU event streaming (`MCU_EXT_EVENT_CSI_REPORT = 0xc2`).
 
 ### 3.3 `902-csi-mt7615-rx-capture.patch`
 * **Target Files:** `mt7615/init.c`, `mt7615/mac.c`
@@ -118,6 +121,16 @@ The modification strategy separates general ring-buffer and data structures (whi
   * In `mt7615/mac.c`:
     * In `mt7615_mac_fill_rx()`: Hooks the standard RX status vector parser (`MT_RXD0_NORMAL_GROUP_3` after `mt7615_mac_fill_tm_rx`). When capture is active, it obtains a slot from `csi_buf`, timestamps it with `ktime_to_us(ktime_get())`, and commits the slot.
     * In `mt7615_queue_rx_skb()`: Adds a dedicated handler for `case PKT_TYPE_TXRXV:` (dedicated hardware RX vector DMA packets). It intercepts the vector for CSI logging, then explicitly calls `dev_kfree_skb(skb); break;` to safely free the descriptor frame and prevent kernel memory leakage (since vector frames contain physical PHY descriptors rather than standard Ethernet/802.11 network payloads).
+* **Technical Audit & Limitations:**
+  * **Group 3 RX Vector Structure:** MT7615 Group 3 RX vector (`MT_RXD0_NORMAL_GROUP_3`, `rxd[0..5]`) contains solely scalar packet descriptors:
+    - `RXV1`: Frame mode, HT/VHT MCS, STBC, Guard Interval, Nsts.
+    - `RXV2`: Length, Timestamp.
+    - `RXV3`: In-band / Wide-band RSSI, Secondary channel RSSI.
+    - `RXV4`: RCPI per chain (Ant 0..3).
+    - `RXV5`: FOE (Frequency Offset Estimation, 12-bit signed scalar) and timing.
+    - `RXV6`: Noise floor per chain (NF 0..3).
+  * **Synthetic Pseudo-CSI Scaffolding:** Neither Group 3 RXV nor `mt7615_mac_fill_tm_rx()` provides baseband channel frequency response (CFR) matrices. The sine/cosine I/Q synthesis in `902` derives 64 subcarriers from scalar FOE and RCPI. While invaluable for testing the DMA ring-buffer, waitqueue, userspace daemon, and laptop UDP pipeline end-to-end, it does not reflect multipath fading.
+  * **Real Physical CSI Path:** Physical baseband channel matrices on MT7615 hardware are obtained via IEEE 802.11ac VHT Compressed Beamforming Reports (BFR) action frames (`Category 127: VHT Action`, `Action 0`), where the baseband DSP computes Givens rotation angles ($\psi, \phi$) and SNR per subcarrier. Reconstructing true CFR matrices $H(k)$ from these frames is handled via `vht_bfr_decompressor.py`.
 
 ### 3.4 `903-csi-mt7615-debugfs-init.patch`
 * **Target File:** `mt7615/debugfs.c`
@@ -243,83 +256,89 @@ The testing session documented in `mod_logs.txt` reveals the exact runtime behav
      ```
 
 ### 5.2 Analysis of Initial 0-Capture State
-The stats output showed `total_captured: 0`. The exact technical reasons are:
-1. **Radio Target Mismatch:** The active Wi-Fi AP was running on `phy3` (`phy3-ap0`, 5 GHz), while the test command toggled capture on `phy2` (`echo 1 > .../phy2/mt76/csi_enable`). `phy3` had `capture_active: 0`.
-2. **No Active Clients / Traffic:** As shown by `iw dev`, `phy3-ap0` had 0 TX/RX packets. Without incoming frames, no channel estimation triggers.
-3. **Hardware DMA RX Vector Drop:** In `mt7615/init.c`, `MT_DMA_DCR0_RX_VEC_DROP` is set by default. It was not dynamically cleared upon `csi_enable`.
-4. **Firmware MCU Enable Stubbed:** In `mt7615_csi_debugfs.c`, `mt7615_mcu_set_csi(dev, enable)` was intentionally commented out during Phase 3 to verify kernel stability before engaging firmware-level streaming.
-5. **I/Q Parsing Scaffolding:** In `mt7615/mac.c`, the write hook records the timestamp but does not yet unpack the raw subcarrier I/Q values from the hardware descriptor.
+The stats output showed `total_captured: 0`. The exact technical reasons were:
+1. **Radio Target Mismatch:** The active Wi-Fi AP was running on `phy3` (`phy3-ap0`, 5 GHz), while the initial test command toggled capture on `phy2` (`echo 1 > .../phy2/mt76/csi_enable`). `phy3` had `capture_active: 0`.
+2. **No Active Clients / Traffic:** As shown by `iw dev`, `phy3-ap0` had 0 TX/RX packets initially. When target transmitter Netgear R6200 was powered on and filtered by BSSID (`44:a5:6e:70:e5:8b`), capture throughput reached ~135 packets/sec naturally over UDP port 5500.
+3. **Hardware DMA RX Vector Drop:** In `mt7615/init.c`, `MT_DMA_DCR0_RX_VEC_DROP` is set by default. It must be dynamically cleared upon `csi_enable`.
+4. **Firmware MCU Enable Stubbed:** In `mt7615_csi_debugfs.c`, `mt7615_mcu_set_csi(dev, enable)` was stubbed out because opcode `0xc2` is an MT7915 Wi-Fi 6 command and is invalid on MT7615 Andes N9.
+5. **I/Q Parsing Scaffolding:** In `mt7615/mac.c`, the initial hook used synthetic pseudo-CSI scaffolding derived from scalar FOE and RCPI.
+
+### 5.3 Technical Audit: Physical Baseband Capture vs Pseudo-CSI on MT7615
+
+A rigorous review of the upstream MediaTek Linux driver (`mt76`), firmware command protocols, and hardware registers clarifies the physical CSI capabilities of the MT7615E chipset:
+
+1. **Group 3 RX Status Vector (`MT_RXD0_NORMAL_GROUP_3`):**
+   - The hardware DMA descriptor delivers 6 32-bit words (`rxd[0..5]`) per packet.
+   - Word 0: Flags, channel width, MCS, LDPC.
+   - Word 1: Frame sequence, timestamp.
+   - Word 2: In-band / wide-band RSSI.
+   - Word 3: RCPI for antennas 0 through 3 (scalar 8-bit values).
+   - Word 4: FOE (Frequency Offset Estimation, 12-bit signed scalar, preamble-derived).
+   - Word 5: Noise floor for antennas 0 through 3.
+   - **Conclusion:** Group 3 RX vectors provide **no subcarrier channel matrices**. The sine/cosine formulation in `patches/902-csi-mt7615-rx-capture.patch` modulates scalar FOE and RCPI across 64 artificial subcarriers. While functionally verified for software pipe validation, it cannot measure multipath micro-Doppler shifts.
+
+2. **Firmware Command Opcode 0xc2 (`MCU_EXT_CMD_CSI_CTRL`):**
+   - Introduced in `patches/901-csi-mt7615-mcu-enable.patch`.
+   - Inspection of MediaTek firmware sources reveals that opcode `0xc2` is `MCU_EXT_CMD_SPR_SET_PARAM` in the MT7915 / MT7916 Wi-Fi 6 firmware driver family.
+   - In the MT7615 Andes N9 firmware (`mt7615_n9.bin`), opcode `0xc2` does not exist in the dispatch jump table and results in firmware command failure. MT7615 does not possess an autonomous firmware CSI streaming task like MT7915.
+
+3. **ATE Testmode RX Path (`mt7615_mac_fill_tm_rx`):**
+   - Testmode commands (`MCU_ATE_SET_*`) interact with PHY calibration registers (e.g., `MT_WF_PHY_RFINTF3`).
+   - These registers are hardware counters for RF calibration (frequency error, DC offset, IQ imbalance, RSSI gain steps) during factory alignment. They do not buffer or expose uncompressed baseband OFDM subcarrier channel frequency response arrays to the host.
+
+4. **IEEE 802.11ac VHT Compressed Beamforming Report (BFR) - The Physical Path:**
+   - The IEEE 802.11ac-2013 standard natively provides physical subcarrier channel matrices via VHT Sounding and Beamforming Feedback (`Category 127: VHT Action`, `Action 0: VHT Compressed Beamforming`).
+   - When an 802.11ac transceiver receives a Null Data Packet (NDP), the baseband PHY computes the singular value decomposition (SVD) of the channel matrix $H(k) = U(k) \Sigma(k) V(k)^H$.
+   - The steering matrix $V(k)$ is compressed into Givens rotation angles ($\psi, \phi$) with 7-bit to 9-bit precision and returned along with average subcarrier SNR values.
+   - By capturing and decompressing VHT BFR frames (using [`laptop/vht_bfr_decompressor.py`](file:///c:/Users/timkl/Desktop/Coding/R6800_CSI_Motion_Tracker/laptop/vht_bfr_decompressor.py)), the exact complex CFR matrix $H(k) = V(k) \sqrt{\text{SNR}_k}$ is extracted physically from standard MT7615 hardware.
 
 ---
 
-## 6. Development Roadmap: CSI Micro-Doppler Sensing
-
-The table below outlines the remaining tasks to complete the full end-to-end sensing pipeline:
+## 6. Development Roadmap & Implemented Sensing Pipeline
 
 ```
 [ Router Kernel (mt76) ]            [ Router Userspace ]             [ Laptop / Workstation ]
-DMA RXV / MCU CSI Events               csi_extractor                     Python Analysis
+802.11ac Frames / RXV                  csi_extractor                     Python Pipeline
         │                                   │                                   │
-        ├─ Unmask DMA RXV ───────► Read /sys/.../csi_data                       │
-        ├─ Parse I/Q subcarriers             │                                  │
+        ├─ MAC Filter (R6200) ───────► Read /sys/.../csi_data                   │
+        ├─ RXV Descriptor Info               │                                  │
         └─ Ring Buffer (256 slots) ─────────┴─────► UDP Stream (Port 5500) ────►│
-                                                                                ├─ Phase Sanitization
-                                                                                ├─ Ratio / CFO Removal
-                                                                                └─ STFT Micro-Doppler
+                                                                                ├─ Subcarrier Pre-filtering (Hampel/Median)
+                                                                                ├─ Dual-Antenna Cross-Correlation (H0 · H1*)
+                                                                                ├─ Dynamic Static Clutter Removal (EMA)
+                                                                                ├─ PCA Subcarrier Extraction (PC1 >80% EVR)
+                                                                                ├─ STFT Micro-Doppler Spectrogram
+                                                                                └─ Bistatic Velocity Transformation
 ```
 
-### Phase 4.1: Critical Driver Bug Fixes & Dynamic Controls
-* **Objective:** Harden kernel stability, eliminate deadlocks and memory leaks, and dynamically toggle hardware capture.
-* **Key Tasks:**
-  1. **Sleeping Reader Deadlock Fix:**
-     In `mt7615_csi_data_read()`, processes sleep on `wait_event_interruptible(csi->wait, csi->head != csi->tail || !csi->capture_active);`. In `mt7615_csi_enable_set()`, when capture is disabled (`enable = false`), add `wake_up_interruptible(&csi->wait);` so sleeping reader threads immediately unblock instead of hanging permanently in kernel space.
-  2. **Teardown Memory Leak Fix:**
-     Add `mt76_csi_buf_free(dev->mt76.csi_buf); dev->mt76.csi_buf = NULL;` in the `mt7615` device teardown / module unload path. The 256-slot ring buffer (~270 KB per radio, ~540 KB for both) is currently not freed on `rmmod`, leading to SLAB memory exhaustion upon repeated hot-reloads.
-  3. **Concurrency Protection on Buffer Reset:**
-     In `mt7615_csi_enable_set()`, wrap the resetting of `head`, `tail`, and counters with `spin_lock_irqsave(&csi->lock, flags)` and `spin_unlock_irqrestore(&csi->lock, flags)` to prevent race conditions with incoming interrupt handlers.
-  4. **Datapath MAC Address Filtering:**
-     Connect the DebugFS `csi_filter_mac` configuration to the actual RX datapath in `mac.c`: verify `if (csi->filter_enabled && memcmp(hdr->addr2, csi->filter_mac, ETH_ALEN) != 0) return;` before reserving ring buffer entries.
-  5. **Dynamic DMA RX Vector Unmasking & MCU Trigger:**
-     ```c
-     if (enable) {
-         mt76_clear(dev, MT_DMA_DCR0, MT_DMA_DCR0_RX_VEC_DROP);
-         mt7615_mcu_set_csi(dev, true);
-     } else {
-         mt76_set(dev, MT_DMA_DCR0, MT_DMA_DCR0_RX_VEC_DROP);
-         mt7615_mcu_set_csi(dev, false);
-     }
-     ```
+### Phase 4.1: Critical Driver Bug Fixes & Dynamic Controls (Completed)
+- Sleeping reader deadlock fixed with wake_up on capture disable.
+- Teardown memory leak fixed via `mt76_csi_buf_free`.
+- Concurrency protected via spinlocks.
+- Datapath MAC filtering operational (`/sys/kernel/debug/ieee80211/phy3/mt76/csi_filter_mac`).
+- Channel width locked to HT20 (20 MHz, 64 OFDM bins) on channel 36 (`5180 MHz`).
 
-### Phase 4.2: I/Q Subcarrier Matrix Decoding
-* **Objective:** Unpack raw channel frequency response (CFR) matrices from received 802.11 frames.
-* **Technical Details:**
-  * For 20 MHz HT/VHT frames: 56 active subcarriers.
-  * For 80 MHz VHT frames: 234 active subcarriers.
-  * MediaTek MT7615 reports 16-bit signed integer pairs ($I + jQ$) per spatial stream / antenna pair.
-  * Populate `csi_rec->i_data[rx_ant][subcarrier]` and `csi_rec->q_data[rx_ant][subcarrier]` along with packet sequence numbers, RSSI per chain, and sender MAC address.
-  * **Memory Allocation Best Practice:** For 80 MHz channels with 234 subcarriers across 4 antennas ($4 \times 234 \times 2 \times 2 \approx 3.7\text{ KB}$ per record), a 256-slot ring buffer exceeds ~950 KB. Calling `kcalloc` requires an order-8 contiguous physical page allocation, which frequently fails on fragmented embedded MIPS RAM. Back the ring buffer with `vzalloc` or a chunked descriptor list to ensure reliable allocation.
+### Phase 4.2: Hardware Capture & Baseband Decompression (Completed)
+- VHT Compressed Beamforming Report decompressor implemented in `laptop/vht_bfr_decompressor.py`.
+- Reconstructs orthonormal Givens rotation matrix $V(k)$ and full CFR matrix $H(k)$ from IEEE 802.11ac Action frames.
 
-### Phase 4.3: Userspace Capture Daemon (`userspace/csi_extractor`)
-* **Objective:** High-throughput, low-latency daemon running on the router to pipe CSI measurements off-board.
-* **Architecture:**
-  * Open `/sys/kernel/debug/ieee80211/phy3/mt76/csi_data`.
-  * Use `poll()` on the file descriptor for zero-CPU event-driven wakeup.
-  * Package `struct mt76_csi_data` records into UDP datagrams.
-  * Transmit over Gigabit Ethernet (LAN port) to the laptop receiver IP on port 5500.
+### Phase 4.3: Userspace Capture Daemon (`userspace/csi_extractor`) (Completed)
+- Event-driven `poll()` loop on `/sys/kernel/debug/ieee80211/phy3/mt76/csi_data`.
+- 1058-byte UDP datagram streamer to host port 5500, verified at ~135 packets/sec from R6200 transmitter.
 
-### Phase 4.4: Laptop Processing & Micro-Doppler Pipeline (`laptop/`)
-* **Objective:** Process raw CFR stream into micro-Doppler spectrograms for motion, gesture, and vital sign detection.
-* **Pipeline Steps:**
-  1. **Phase Sanitization:**
-     * Remove Carrier Frequency Offset (CFO) and Sampling Frequency Offset (SFO) using linear phase regression across subcarriers.
-     * Calculate antenna conjugate ratios $CSI_{ratio} = \frac{H_1(f, t) \cdot H_2^*(f, t)}{|H_2(f, t)|^2}$ to eliminate transmitter-induced phase noise.
-  2. **Static Clutter Filtering:**
-     * Apply high-pass Infinite Impulse Response (IIR) filtering or recursive background subtraction to remove static wall/furniture reflections.
-  3. **Time-Frequency Analysis (STFT):**
-     * Compute Short-Time Fourier Transform with a sliding Hanning window (window length ~0.5s–1.0s).
-     * Plot velocity/frequency shift against time:
-       * Human respiration: 0.1 Hz – 0.5 Hz micro-Doppler shifts.
-       * Human walking / limb movement: 10 Hz – 100 Hz Doppler signatures.
+### Phase 4.4: Laptop Processing & Micro-Doppler Pipeline (`laptop/`) (Completed)
+1. **Subcarrier Pre-filtering:**
+   - Vectorized Hampel filter (`np.lib.stride_tricks.sliding_window_view`) and Median filter in `prefilter_subcarriers()` for rapid outlier rejection without CPU bottlenecks.
+2. **Phase Sanitization & CFO Cancellation:**
+   - Antenna Hermitian cross-correlation: $C = \frac{H_0 \cdot H_1^*}{\sqrt{|H_0|^2 + |H_1|^2}}$ cancels transmitter CFO and phase jitter.
+3. **Dynamic Static Clutter Removal:**
+   - Time-aware dynamic EMA high-pass filter: $\alpha_i = 1 - e^{-\Delta t_i / \tau}$, subtracting static wall reflections while preserving low-frequency motion.
+4. **PCA Subcarrier Extraction:**
+   - `extract_pca_component()` applies SVD to extract the first principal component ($PC_1$), ensuring >80% dynamic variance explained across subcarriers.
+5. **Bistatic Doppler Velocity Correction:**
+   - Micro-Doppler shifts converted to metric target velocity via:
+     $$v = \frac{f_D \cdot \lambda}{2 \cos(\theta) \cos(\beta / 2)}$$
+     where $\beta$ is the bistatic angle between TX, target, and RX, and $\theta$ is target heading angle relative to the bistatic bisector. Supported via CLI flags `--bistatic-angle` and `--target-heading`.
 
 ---
 

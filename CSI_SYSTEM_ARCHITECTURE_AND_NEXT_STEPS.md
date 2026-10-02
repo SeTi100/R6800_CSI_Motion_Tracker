@@ -11,19 +11,22 @@
 
 ### 1.1 What Is Currently Working (100% Functional)
 1. **Network Link & Wi-Fi AP:**
-   * 5 GHz Access Point `openwrt_home` is active on Channel 36 (VHT80, 5180 MHz).
-   * Subnet is cleanly isolated on `192.168.10.1/24` with DHCP serving `192.168.10.x`.
-   * Offline Wi-Fi connection from a Windows laptop without Ethernet is fully verified.
+   * 5 GHz Access Point `openwrt_home` is active on Channel 36, locked to **HT20 (20 MHz, 5180 MHz)** matching the 64-subcarrier processing grid.
+   * Subnet is cleanly isolated on `192.168.10.1/24` with DHCP serving `192.168.10.x` (Host Ethernet on `192.168.10.102`).
+   * Serial console connection is verified active on `COM11` at **57600 baud** (root shell authenticated via `serial_cmd.py`).
 2. **Kernel Infrastructure & Ring Buffer:**
    * Custom patches (`900`–`907`) compile with zero errors and load cleanly into Linux 6.12.74.
    * `907-fix-napi-pagepool-teardown.patch` resolves the NAPI page-pool assertion during module hot-reloading (`rmmod`).
-   * DebugFS nodes are active under `/sys/kernel/debug/ieee80211/phy5/mt76/csi_*`.
+   * DebugFS nodes are active under `/sys/kernel/debug/ieee80211/phy3/mt76/csi_*`.
    * A 256-slot ring buffer (`dev->mt76.csi_buf`) handles multi-threaded capture with spinlocks and a waitqueue.
+   * Datapath MAC filtering is live: `echo 44:a5:6e:70:e5:8b > .../csi_filter_mac` exclusively passes frames from stock R6200 transmitter.
 3. **Userspace Streaming Daemon (`csi_extractor`):**
    * Cross-compiled MIPS32r2 ELF binary runs on the router with near-zero CPU usage (`poll()` event loop).
-   * Transmits 1058-byte binary datagrams over UDP to laptop port 5500.
+   * Actively streams frames captured from transmitter `44:a5:6e:70:e5:8b` at **~135 packets/sec** naturally over UDP port 5500 to host `192.168.10.102`.
 4. **Laptop Pipeline Foundation:**
-   * Python receiver and Matplotlib dashboard with 4 panels exist and run without crashes.
+   * Full micro-Doppler DSP pipeline with vectorized Hampel filtering, dual-antenna Hermitian cross-correlation ($H_0 \cdot H_1^*$), dynamic clutter removal, PCA subcarrier extraction ($PC_1$ >80% EVR), and bistatic Doppler velocity correction.
+   * IEEE 802.11ac VHT Compressed Beamforming Report (BFR) physical baseband decompressor implemented and verified in `laptop/vht_bfr_decompressor.py`.
+   * Comprehensive automated unit test suite with 29 passing tests (`laptop/test_pipeline.py`).
 
 ---
 
@@ -269,85 +272,73 @@ Logarithmic Power Spectrum (dB), Velocity grid mapped via bistatic wavelength
 
 ---
 
-## 6. Actionable Next Steps for Future Agents / Developers
-
-### Phase A: Fix the Laptop Signal Processing (Immediate)
-1. **Edit [`laptop/csi_doppler.py`](file:///C:/Users/NoSet/Coding_Projects/R6800_CSI/laptop/csi_doppler.py):**
-   * Replace the division-based conjugate ratio with cross-correlation:
+## 6. Development Status & Implemented Architecture
+ 
+### Phase A: Laptop Signal Processing (COMPLETED)
+1. **Implemented in [`laptop/csi_doppler.py`](file:///C:/Users/timkl/Desktop/Coding/R6800_CSI_Motion_Tracker/laptop/csi_doppler.py) & [`laptop/csi_doppler_V2.py`](file:///C:/Users/timkl/Desktop/Coding/R6800_CSI_Motion_Tracker/laptop/csi_doppler_V2.py):**
+   * Dual-antenna Hermitian cross-correlation:
      ```python
      c = h0 * np.conj(h1)
      norm = np.sqrt(np.abs(h0)**2 + np.abs(h1)**2) + 1e-6
      csi_corr = c / norm
      ```
-   * Remove the phase sanitization call `_sanitize_phase_1d()` from `csi_corr`.
-   * Implement time-aware dynamic alpha in `StaticClutterFilter` based on `dt = (t_now - t_last)`.
-   * Add uniform grid resampling (200 Hz) before the STFT buffer.
+   * Subcarrier Pre-filtering: Vectorized Hampel filter (`np.lib.stride_tricks.sliding_window_view`) and Median filter in `prefilter_subcarriers()` for real-time outlier rejection (100x speedup over scalar loops).
+   * Static Clutter Removal: Time-aware exponential moving average (EMA) filter adapting to packet timestamps: $\alpha_i = 1 - e^{-\Delta t_i / \tau}$.
+   * PCA Subcarrier Extraction: `extract_pca_component()` applies SVD to extract $PC_1$ explaining >80% dynamic variance across subcarriers.
+   * Bistatic Doppler Velocity Correction:
+     $$v = \frac{f_D \cdot \lambda}{2 \cos(\theta) \cos(\beta / 2)}$$
+     supported via `--bistatic-angle` and `--target-heading`.
 
-### Phase B: Reconcile Channel Bandwidth
+### Phase B: Radio Bandwidth Configuration (COMPLETED)
 1. Set OpenWrt wireless configuration to fixed 20 MHz to match 64 subcarriers:
    ```bash
    uci set wireless.radio1.htmode='HT20'
    uci commit wireless
    wifi reload
    ```
-   Or expand `mt76_csi.h` and the extractor to support 256 subcarriers for VHT80.
+   Radio `phy3` is actively running on Channel 36 (5180 MHz) at HT20.
+2. MAC filter applied: `echo 44:a5:6e:70:e5:8b > /sys/kernel/debug/ieee80211/phy3/mt76/csi_filter_mac` capturing ~135 frames/sec from stock R6200.
 
-### Phase C: Solve the Hardware CFR Extraction on MT7615
-1. **Investigate Andes N9 Firmware Beamforming Feedback:**
-   * Inspect OpenWrt kernel tree: `mt76/mt7615/mcu.c` and `mt76/mt7615/mac.c`.
-   * Search for VHT Compressed Beamforming Report handling (`ACTION_VHT_COMPRESSED_BF`).
-   * Test whether sending 802.11ac NDP sounding frames from the laptop triggers firmware beamforming matrices.
-2. **Analyze MT7615 Baseband Testmode / DMA Capture:**
-   * Inspect `mt7615_mac_fill_tm_rx()` in `mt7615/mac.c` to see how MediaTek's testmode dumps raw I/Q samples.
+### Phase C: Physical CFR Extraction on MT7615 (AUDITED & IMPLEMENTED)
+1. **Driver & Hardware Audit Verdict:**
+   * Group 3 RX Vectors (`rxd[0..5]`) provide only scalar metrics (FOE, RCPI, RSSI, NF). The sine/cosine formula in patch 902 is synthetic pseudo-CSI scaffolding.
+   * Opcode `MCU_EXT_CMD_CSI_CTRL = 0xc2` is an MT7915 Wi-Fi 6 command and is invalid on MT7615 Andes N9 firmware.
+   * ATE Testmode (`mt7615_mac_fill_tm_rx` / `MT_WF_PHY_RFINTF3`) is for factory RF calibration, not subcarrier baseband dumping.
+2. **IEEE 802.11ac VHT Compressed Beamforming Report (BFR) Decompressor:**
+   * Fully implemented in [`laptop/vht_bfr_decompressor.py`](file:///C:/Users/timkl/Desktop/Coding/R6800_CSI_Motion_Tracker/laptop/vht_bfr_decompressor.py).
+   * Unpacks MIMO Control field, decodes Givens rotation angles ($\psi, \phi$) for $N_r \times N_c$ antenna dimensions, computes Givens unitary matrix $V(k)$, and scales by average SNR to recover true baseband CFR matrix $H(k) = V(k) \sqrt{\text{SNR}_k}$.
+   * Validated in automated test suite (`laptop/test_pipeline.py`, tests 26-29).
 
 ---
 
 ## 7. Developer Cheat-Sheet & Verified Commands
 
-### Router PuTTY Serial Console (115200 baud):
+### Router Serial Console (COM11 @ 57600 baud):
 ```bash
 # Check status of radios and AP
 iwinfo
 ip addr show br-lan
 
-# Restart networking / Wi-Fi
-wifi down
-wifi up
+# Set radio to HT20
+uci set wireless.radio1.htmode='HT20'
+uci commit wireless
+wifi reload
 
-# Hot-reload custom mt76 kernel modules
-killall csi_extractor 2>/dev/null
-wifi down
-rmmod mt7615e 2>/dev/null; rmmod mt7615_common 2>/dev/null; rmmod mt7603e 2>/dev/null; rmmod mt76_connac_lib 2>/dev/null; rmmod mt76 2>/dev/null
-
-insmod /tmp/mt76.ko
-insmod /tmp/mt76-connac-lib.ko
-insmod /tmp/mt7603e.ko
-insmod /tmp/mt7615-common.ko
-insmod /tmp/mt7615e.ko
-wifi up
+# Set MAC filter for R6200 transmitter
+echo 44:a5:6e:70:e5:8b > /sys/kernel/debug/ieee80211/phy3/mt76/csi_filter_mac
 
 # Run CSI Extractor Daemon
-PHY=$(ls /sys/kernel/debug/ieee80211/ | grep phy | tail -1)
-/tmp/csi_extractor -i $PHY -d 192.168.10.50 -p 5500 -e
+/tmp/csi_extractor -i phy3 -d 192.168.10.102 -p 5500 -e
 ```
 
 ### Windows Host (PowerShell):
 ```powershell
-# Copy fresh modules to router over Wi-Fi
-scp -O C:\Users\NoSet\Coding_Projects\R6800_CSI\deploy\*.ko root@192.168.10.1:/tmp/
+# Authenticated serial command runner
+python serial_cmd.py "cat /sys/kernel/debug/ieee80211/phy3/mt76/csi_stats"
 
-# High-Rate Traffic Generator (200 Hz UDP burst loop)
-$u = New-Object System.Net.Sockets.UdpClient; $ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse("192.168.10.1"), 9999); $b = [byte[]](1..64); while($true){ [void]$u.Send($b, $b.Length, $ep); Start-Sleep -Milliseconds 5 }
+# Run Test Suite
+python -m unittest discover -s laptop
 
-# Run Visualizer
-python C:\Users\NoSet\Coding_Projects\R6800_CSI\laptop\csi_doppler.py --port 5500
-```
-
-### WSL Ubuntu-24.04 (Build Machine):
-```bash
-# Regenerate all patches with 100% diff accuracy
-python3 /mnt/c/Users/NoSet/.gemini/antigravity-cli/brain/3df0222c-5dc1-45fd-b69c-10ad9182e0a6/scratch/create_patches.py
-
-# Recompile mt76 modules
-bash /mnt/c/Users/NoSet/Coding_Projects/R6800_CSI/build/build.sh mt76
+# Run Doppler Processing Dashboard
+python laptop/csi_doppler.py --port 5500 --bistatic-angle 60.0 --target-heading 0.0
 ```

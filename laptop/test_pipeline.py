@@ -18,6 +18,7 @@ import sys
 import time
 import socket
 import struct
+import math
 import tempfile
 import unittest
 import numpy as np
@@ -738,6 +739,193 @@ class TestCSIPipeline(unittest.TestCase):
             self.assertEqual(args.clim_min, -35.0)
         finally:
             sys.argv = orig_argv
+
+    def test_26_pca_subcarrier_extraction_and_variance(self):
+        """Verify PCA extraction captures >80% dynamic variance under correlated motion."""
+        from csi_doppler_V2 import extract_pca_component, MicroDopplerProcessor
+
+        # Simulate 128 time samples across 52 active subcarriers with Doppler motion
+        W, K = 128, 52
+        t = np.linspace(0, 0.64, W)
+        motion = np.exp(1j * 2 * np.pi * 18.0 * t)  # 18 Hz Doppler
+        gains = np.random.uniform(0.8, 1.2, K) * np.exp(1j * np.random.uniform(0, 2 * np.pi, K))
+        subcarrier_mat = np.outer(motion, gains) + 0.05 * (
+            np.random.randn(W, K) + 1j * np.random.randn(W, K)
+        )
+
+        # Direct PCA extraction test
+        pc1, evr = extract_pca_component(subcarrier_mat)
+        self.assertEqual(len(pc1), W)
+        self.assertGreater(evr, 0.80, f"Expected EVR > 0.80, got {evr:.4f}")
+
+        # MicroDopplerProcessor with PCA enabled
+        proc_pca = MicroDopplerProcessor(
+            window_size=128, step_size=8, n_fft=256, sampling_rate=200.0, use_pca=True
+        )
+        gen = MockCSIGenerator(sample_rate=200.0)
+        for i in range(160):
+            pkt = gen.generate_packet()
+            proc_pca.add_frame(pkt.csi_complex, i / 200.0)
+
+        spec, _, _ = proc_pca.get_spectrogram_matrix()
+        self.assertIsNotNone(spec)
+        self.assertGreater(proc_pca.last_pca_evr, 0.80)
+
+        # MicroDopplerProcessor with PCA disabled (fallback to mean)
+        proc_no_pca = MicroDopplerProcessor(
+            window_size=128, step_size=8, n_fft=256, sampling_rate=200.0, use_pca=False
+        )
+        for i in range(160):
+            pkt = gen.generate_packet()
+            proc_no_pca.add_frame(pkt.csi_complex, i / 200.0)
+
+        spec_no_pca, _, _ = proc_no_pca.get_spectrogram_matrix()
+        self.assertIsNotNone(spec_no_pca)
+        self.assertEqual(proc_no_pca.last_pca_evr, 0.0)
+
+    def test_27_bistatic_doppler_velocity_correction(self):
+        """Verify bistatic Doppler conversion formula f_D = (2v / lambda) * cos(theta) * cos(beta / 2)."""
+        from csi_doppler_V2 import bistatic_velocity_factor, MicroDopplerProcessor, CARRIER_FREQ_5G, SPEED_OF_LIGHT
+
+        wavelength = SPEED_OF_LIGHT / CARRIER_FREQ_5G  # ~0.0575 m
+
+        # 1. Monostatic limit (beta = 0, theta = 0)
+        k_mono = bistatic_velocity_factor(wavelength, bistatic_angle_rad=0.0, target_heading_rad=0.0)
+        self.assertAlmostEqual(k_mono, wavelength / 2.0, places=6)
+
+        # 2. Bistatic geometry: beta = 60 deg (cos(beta/2) = cos(30 deg) = sqrt(3)/2), theta = 0
+        beta_rad = math.radians(60.0)
+        k_bi60 = bistatic_velocity_factor(wavelength, bistatic_angle_rad=beta_rad, target_heading_rad=0.0)
+        expected_k = wavelength / (2.0 * math.cos(math.radians(30.0)))
+        self.assertAlmostEqual(k_bi60, expected_k, places=6)
+
+        # 3. Heading angle: beta = 0, theta = 45 deg
+        theta_rad = math.radians(45.0)
+        k_theta45 = bistatic_velocity_factor(wavelength, bistatic_angle_rad=0.0, target_heading_rad=theta_rad)
+        self.assertAlmostEqual(k_theta45, wavelength / (2.0 * math.cos(theta_rad)), places=6)
+
+        # 4. MicroDopplerProcessor geometry update
+        proc = MicroDopplerProcessor(
+            window_size=128, step_size=8, n_fft=256, sampling_rate=200.0,
+            bistatic_angle_deg=0.0, target_heading_deg=0.0
+        )
+        initial_v_max = float(proc.velocity_bins[-1])
+
+        # Setting bistatic angle to 60 deg scales velocity bins by 1 / cos(30 deg) ~ 1.1547
+        proc.update_bistatic_geometry(bistatic_angle_deg=60.0, target_heading_deg=0.0)
+        updated_v_max = float(proc.velocity_bins[-1])
+        ratio = updated_v_max / initial_v_max
+        self.assertAlmostEqual(ratio, 1.0 / math.cos(math.radians(30.0)), places=4)
+
+        # 5. CLI parser argument verification for bistatic flags
+        orig_argv = sys.argv
+        try:
+            sys.argv = [
+                "csi_doppler_V2.py",
+                "--mock",
+                "--bistatic-angle", "45.0",
+                "--target-heading", "15.0",
+                "--no-pca",
+            ]
+            import argparse
+            p = argparse.ArgumentParser()
+            p.add_argument("--mock", action="store_true")
+            p.add_argument("--bistatic-angle", type=float, default=0.0)
+            p.add_argument("--target-heading", type=float, default=0.0)
+            p.add_argument("--no-pca", action="store_true")
+            args = p.parse_args(sys.argv[1:])
+            self.assertEqual(args.bistatic_angle, 45.0)
+            self.assertEqual(args.target_heading, 15.0)
+            self.assertTrue(args.no_pca)
+        finally:
+            sys.argv = orig_argv
+
+    def test_28_subcarrier_prefiltering_hampel_and_median(self):
+        """Verify prefilter_subcarriers removes impulse noise across 1D and 2D subcarrier arrays."""
+        from csi_doppler_V2 import prefilter_subcarriers
+
+        # 1. 1D real array with outlier
+        clean_1d = np.linspace(1.0, 5.0, 32)
+        noisy_1d = np.copy(clean_1d)
+        noisy_1d[10] = 999.0
+        filtered_hampel = prefilter_subcarriers(noisy_1d, method="hampel")
+        self.assertLess(filtered_hampel[10], 10.0)
+        self.assertAlmostEqual(filtered_hampel[5], clean_1d[5], places=4)
+
+        filtered_median = prefilter_subcarriers(noisy_1d, method="median")
+        self.assertLess(filtered_median[10], 10.0)
+
+        # 2. 1D complex array with outlier
+        complex_clean = np.exp(1j * np.linspace(0, np.pi, 32)) * 10.0
+        complex_noisy = np.copy(complex_clean)
+        complex_noisy[15] = 500.0 + 500.0j
+        filtered_complex = prefilter_subcarriers(complex_noisy, method="hampel")
+        self.assertLess(abs(filtered_complex[15]), 50.0)
+
+        # 3. 2D array (4 antennas x 64 subcarriers)
+        mat_2d = np.ones((4, 64), dtype=complex) * (5.0 + 2.0j)
+        mat_2d[2, 30] = 1000.0 + 1000.0j
+        filtered_2d = prefilter_subcarriers(mat_2d, method="hampel")
+        self.assertAlmostEqual(filtered_2d[2, 30].real, 5.0, places=3)
+        self.assertAlmostEqual(filtered_2d[2, 30].imag, 2.0, places=3)
+
+    def test_29_vht_bfr_decompressor(self):
+        """Verify IEEE 802.11ac VHT Compressed Beamforming Report decompressor."""
+        from vht_bfr_decompressor import (
+            get_vht_subcarriers,
+            construct_givens_matrix,
+            encode_vht_bfr,
+            decompress_vht_bfr,
+        )
+
+        # 1. Subcarrier list for 20 MHz VHT
+        tones_20m = get_vht_subcarriers(channel_width=0, grouping=0)
+        self.assertGreaterEqual(len(tones_20m), 48)
+
+        # 2. Test 2x1 MIMO Givens reconstruction (orthonormality)
+        phi_angles = [math.pi / 4.0]
+        psi_angles = [math.pi / 3.0]
+        V_2x1 = construct_givens_matrix(n_r=2, n_c=1, phi_angles=phi_angles, psi_angles=psi_angles)
+        self.assertEqual(V_2x1.shape, (2, 1))
+        # Column norm must be 1.0 (orthonormal steering vector)
+        norm = np.linalg.norm(V_2x1[:, 0])
+        self.assertAlmostEqual(norm, 1.0, places=6)
+
+        # 3. Test 4x2 MIMO Givens reconstruction (unitary columns)
+        # For Nr=4, Nc=2: sum_{i=0..1}(4 - 1 - i) = (3) + (2) = 5 angle pairs
+        phi_5 = [0.1, 0.2, 0.3, 0.4, 0.5]
+        psi_5 = [0.2, 0.3, 0.4, 0.5, 0.6]
+        V_4x2 = construct_givens_matrix(n_r=4, n_c=2, phi_angles=phi_5, psi_angles=psi_5)
+        self.assertEqual(V_4x2.shape, (4, 2))
+        vh_v = V_4x2.conj().T @ V_4x2
+        self.assertTrue(np.allclose(vh_v, np.eye(2), atol=1e-5))
+
+        # 4. End-to-end BFR encoding, parsing, and CFR matrix reconstruction
+        angles_map = {}
+        for tone in tones_20m:
+            angles_map[int(tone)] = ([math.pi / 3.0], [math.pi / 6.0])
+
+        bfr_bytes = encode_vht_bfr(
+            n_c=1, n_r=2, channel_width=0, grouping=0, codebook_info=0,
+            dialog_token=7, avg_snr=[30.0], angles_per_subcarrier=angles_map
+        )
+        self.assertGreater(len(bfr_bytes), 20)
+
+        report = decompress_vht_bfr(bfr_bytes)
+        self.assertEqual(report.n_c, 1)
+        self.assertEqual(report.n_r, 2)
+        self.assertEqual(report.channel_width, 0)
+        self.assertEqual(report.dialog_token, 7)
+        self.assertAlmostEqual(report.avg_snr[0], 30.0, delta=0.5)
+
+        # Check reconstructed channel matrix on tone
+        first_tone = int(tones_20m[0])
+        H_first = report.get_channel_matrix(first_tone)
+        self.assertIsNotNone(H_first)
+        self.assertEqual(H_first.shape, (2, 1))
+        # Energy should scale with sqrt(SNR) = sqrt(10^(30/10)) = sqrt(1000) ~ 31.62
+        expected_scale = math.sqrt(10.0 ** (30.0 / 10.0))
+        self.assertAlmostEqual(np.linalg.norm(H_first), expected_scale, delta=1.5)
 
 
 if __name__ == "__main__":

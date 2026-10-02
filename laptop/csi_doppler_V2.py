@@ -57,11 +57,94 @@ ENABLE_PHASE_FILTERING = True        # Hampel / median filtering on raw phases t
 PHASE_FILTER_METHOD = "hampel"       # "hampel" or "median"
 ENABLE_PERCENTILE_SCALING = True     # 10th-99th percentile dynamic scaling for spectrogram clim
 ENABLE_SINGLE_ANTENNA = False        # Fallback to single antenna instead of antenna conjugate cross-correlation
+ENABLE_PCA = True                    # Principal Component Analysis to extract PC1 (>80% dynamic variance)
+ENABLE_SUBCARRIER_PREFILTER = False  # Pre-filter subcarriers with Hampel/Median filter (disabled by default for performance)
+BISTATIC_ANGLE_DEG_DEFAULT = 0.0     # Bistatic angle beta in degrees (default 0.0)
+TARGET_HEADING_DEG_DEFAULT = 0.0     # Target motion heading theta in degrees (default 0.0)
+
+
+def bistatic_velocity_factor(
+    wavelength: float,
+    bistatic_angle_rad: float = 0.0,
+    target_heading_rad: float = 0.0,
+) -> float:
+    """
+    Computes velocity conversion factor K such that v = f_D * K using bistatic Doppler equation:
+      f_D = (2 * v / lambda) * cos(theta) * cos(beta / 2)
+      => v = f_D * lambda / (2 * cos(theta) * cos(beta / 2))
+    where beta is the bistatic angle and theta is the target heading relative to bistatic bisector.
+    """
+    cos_geom = math.cos(target_heading_rad) * math.cos(bistatic_angle_rad / 2.0)
+    if abs(cos_geom) < 1e-4:
+        cos_geom = 1e-4 if cos_geom >= 0 else -1e-4
+    return wavelength / (2.0 * cos_geom)
+
+
+def prefilter_subcarriers(
+    x: np.ndarray,
+    method: str = "hampel",
+    window_size: int = 5,
+    n_sigmas: float = 3.0,
+) -> np.ndarray:
+    """
+    Pre-filter subcarrier stream across tones to remove outliers/impulse noise.
+    Supports Hampel filter or Median filter.
+    """
+    arr = np.asarray(x)
+    if arr.size == 0:
+        return np.copy(arr)
+
+    if arr.ndim == 1:
+        if np.iscomplexobj(arr):
+            if method == "median":
+                re = median_filter_1d(arr.real, window_size=window_size)
+                im = median_filter_1d(arr.imag, window_size=window_size)
+            else:
+                re = hampel_filter(arr.real, window_size=window_size, n_sigmas=n_sigmas)
+                im = hampel_filter(arr.imag, window_size=window_size, n_sigmas=n_sigmas)
+            return re + 1j * im
+        else:
+            if method == "median":
+                return median_filter_1d(arr, window_size=window_size)
+            return hampel_filter(arr, window_size=window_size, n_sigmas=n_sigmas)
+
+    out = np.zeros_like(arr)
+    for i in range(arr.shape[0]):
+        out[i] = prefilter_subcarriers(arr[i], method=method, window_size=window_size, n_sigmas=n_sigmas)
+    return out
+
+
+def extract_pca_component(
+    subcarriers: np.ndarray,
+    min_explained_variance_ratio: float = 0.5,
+) -> Tuple[np.ndarray, float]:
+    """
+    Extract the first Principal Component (PC1) across subcarriers.
+    Input: subcarriers of shape (N_time, N_subcarriers) complex.
+    Returns: (pc1_signal, explained_variance_ratio)
+      pc1_signal: 1D complex array of length N_time representing dominant motion signature.
+      explained_variance_ratio: fraction of dynamic variance explained by PC1 (0.0 to 1.0).
+    """
+    if subcarriers.ndim != 2 or subcarriers.shape[0] < 2 or subcarriers.shape[1] < 1:
+        return (np.mean(subcarriers, axis=-1) if subcarriers.ndim >= 2 else subcarriers), 0.0
+
+    x_c = subcarriers - np.mean(subcarriers, axis=0, keepdims=True)
+    try:
+        u, s, vh = np.linalg.svd(x_c, full_matrices=False)
+        total_var = float(np.sum(s ** 2))
+        if total_var > 1e-12:
+            evr = float((s[0] ** 2) / total_var)
+            pc1 = u[:, 0] * s[0]
+            return pc1, evr
+        else:
+            return np.mean(subcarriers, axis=1), 0.0
+    except Exception:
+        return np.mean(subcarriers, axis=1), 0.0
 
 
 def hampel_filter(x: np.ndarray, window_size: int = 5, n_sigmas: float = 3.0) -> np.ndarray:
     """
-    Hampel filter to detect and replace outliers in a 1D sequence.
+    Fast vectorized Hampel filter to detect and replace outliers in a 1D sequence.
     Computes rolling median and Median Absolute Deviation (MAD).
     Points deviating by more than n_sigmas * MAD from the median are replaced with the median.
     """
@@ -70,18 +153,16 @@ def hampel_filter(x: np.ndarray, window_size: int = 5, n_sigmas: float = 3.0) ->
     if n < window_size:
         return np.copy(x_arr)
 
-    y = np.copy(x_arr)
     k = window_size // 2
-    for i in range(n):
-        start = max(0, i - k)
-        end = min(n, i + k + 1)
-        w = x_arr[start:end]
-        med = float(np.median(w))
-        mad = 1.4826 * float(np.median(np.abs(w - med)))
-        threshold = n_sigmas * mad if mad > 1e-6 else 1e-3
-        if abs(x_arr[i] - med) > threshold:
-            y[i] = med
-    return y
+    padded = np.pad(x_arr, k, mode='edge')
+    windows = np.lib.stride_tricks.sliding_window_view(padded, window_size)
+    med = np.median(windows, axis=-1)
+    mad = 1.4826 * np.median(np.abs(windows - med[:, None]), axis=-1)
+    thresh = np.where(mad > 1e-6, n_sigmas * mad, 1e-3)
+    out = np.copy(x_arr)
+    mask = np.abs(x_arr - med) > thresh
+    out[mask] = med[mask]
+    return out
 
 
 def median_filter_1d(x: np.ndarray, window_size: int = 3) -> np.ndarray:
@@ -223,6 +304,10 @@ class MicroDopplerProcessor:
         clutter_alpha: float = 0.04,
         num_doppler_bins: Optional[int] = None,
         single_antenna: bool = False,
+        bistatic_angle_deg: float = BISTATIC_ANGLE_DEG_DEFAULT,
+        target_heading_deg: float = TARGET_HEADING_DEG_DEFAULT,
+        use_pca: bool = True,
+        use_subcarrier_prefilter: bool = False,
     ):
         self.window_size = int(window_size)
         self.step_size = int(step_size)
@@ -232,6 +317,15 @@ class MicroDopplerProcessor:
         self.wavelength = SPEED_OF_LIGHT / self.carrier_freq
         self.doppler_limit_hz = float(doppler_limit_hz)
         self.single_antenna = single_antenna
+
+        # Bistatic geometry and PCA configuration
+        self.bistatic_angle_deg = float(bistatic_angle_deg)
+        self.target_heading_deg = float(target_heading_deg)
+        self.bistatic_angle_rad = math.radians(self.bistatic_angle_deg)
+        self.target_heading_rad = math.radians(self.target_heading_deg)
+        self.use_pca = use_pca
+        self.use_subcarrier_prefilter = use_subcarrier_prefilter
+        self.last_pca_evr = 0.0
 
         self.hanning_win = np.hanning(self.window_size)
         self.clutter_filter = StaticClutterFilter(alpha=clutter_alpha)
@@ -258,7 +352,10 @@ class MicroDopplerProcessor:
             self.num_bins = (self.n_fft // 2 + 1) if (self.n_fft % 2 == 0) else self.n_fft
 
         self.freq_bins = np.linspace(-self.doppler_limit_hz, self.doppler_limit_hz, self.num_bins)
-        self.velocity_bins = self.freq_bins * (self.wavelength / 2.0)
+        self.bistatic_factor = bistatic_velocity_factor(
+            self.wavelength, self.bistatic_angle_rad, self.target_heading_rad
+        )
+        self.velocity_bins = self.freq_bins * self.bistatic_factor
 
         # Precompute FFT frequency grid based on current sampling rate
         self.current_fft_freqs = np.fft.fftshift(np.fft.fftfreq(self.n_fft, d=1.0 / self.fs))
@@ -267,6 +364,18 @@ class MicroDopplerProcessor:
         self.peak_doppler_hz = 0.0
         self.peak_velocity_mps = 0.0
 
+    def update_bistatic_geometry(self, bistatic_angle_deg: float, target_heading_deg: float):
+        """Update bistatic angle and target heading angles."""
+        with self._lock:
+            self.bistatic_angle_deg = float(bistatic_angle_deg)
+            self.target_heading_deg = float(target_heading_deg)
+            self.bistatic_angle_rad = math.radians(self.bistatic_angle_deg)
+            self.target_heading_rad = math.radians(self.target_heading_deg)
+            self.bistatic_factor = bistatic_velocity_factor(
+                self.wavelength, self.bistatic_angle_rad, self.target_heading_rad
+            )
+            self.velocity_bins = self.freq_bins * self.bistatic_factor
+
     def update_band(self, band: int):
         """Update carrier frequency and velocity bins based on wireless band (0=2.4GHz, 1=5GHz)."""
         with self._lock:
@@ -274,7 +383,10 @@ class MicroDopplerProcessor:
             if abs(target_freq - self.carrier_freq) > 1e6:
                 self.carrier_freq = target_freq
                 self.wavelength = SPEED_OF_LIGHT / self.carrier_freq
-                self.velocity_bins = self.freq_bins * (self.wavelength / 2.0)
+                self.bistatic_factor = bistatic_velocity_factor(
+                    self.wavelength, self.bistatic_angle_rad, self.target_heading_rad
+                )
+                self.velocity_bins = self.freq_bins * self.bistatic_factor
 
     def update_sampling_rate(self, fs: float):
         """Dynamically update sampling rate if observed packet rate changes."""
@@ -303,6 +415,10 @@ class MicroDopplerProcessor:
             elif self.timestamps and rel_t < self.timestamps[-1]:
                 # Preserve monotonic non-decreasing timestamp axis under jitter
                 rel_t = self.timestamps[-1]
+
+            # Optional subcarrier pre-filtering (Hampel/Median) across tones
+            if (ENABLE_SUBCARRIER_PREFILTER and self.use_subcarrier_prefilter) and csi_frame is not None:
+                csi_frame = prefilter_subcarriers(csi_frame, method=PHASE_FILTER_METHOD)
 
             # Antenna conjugate cross-correlation or single-antenna fallback
             if (self.single_antenna or ENABLE_SINGLE_ANTENNA) and csi_frame is not None:
@@ -366,19 +482,30 @@ class MicroDopplerProcessor:
                 if n_sc > 8:
                     sc_start = min(4, n_sc // 8)
                     sc_end = max(sc_start + 1, n_sc - sc_start)
-                    signal_slice = np.mean(window_no_dc[:, sc_start:sc_end], axis=1)
-                elif n_sc > 0:
-                    signal_slice = np.mean(window_no_dc, axis=1)
+                    active_window = window_no_dc[:, sc_start:sc_end]
+                else:
+                    active_window = window_no_dc
+
+                # Extract PC1 if PCA enabled, else fall back to subcarrier mean
+                if (ENABLE_PCA and self.use_pca) and active_window.shape[1] >= 2:
+                    signal_slice, evr = extract_pca_component(active_window)
+                    self.last_pca_evr = evr
+                elif active_window.shape[1] > 0:
+                    signal_slice = np.mean(active_window, axis=1)
+                    self.last_pca_evr = 0.0
                 else:
                     signal_slice = np.zeros(self.window_size, dtype=np.complex64)
+                    self.last_pca_evr = 0.0
             else:
                 signal_slice = np.array(list(self.time_buffer)[-self.window_size:])
                 if ENABLE_DC_REMOVAL:
                     signal_slice = signal_slice - np.mean(signal_slice)
+                self.last_pca_evr = 0.0
         else:
             signal_slice = np.array(list(self.time_buffer)[-self.window_size:])
             if ENABLE_DC_REMOVAL:
                 signal_slice = signal_slice - np.mean(signal_slice)
+            self.last_pca_evr = 0.0
 
         if ENABLE_DC_REMOVAL and len(signal_slice) > 0:
             signal_slice = signal_slice - np.mean(signal_slice)
@@ -596,6 +723,9 @@ class MicroDopplerApp:
         use_blit: bool = True,
         clim_min: float = -40.0,
         clim_max: float = 20.0,
+        bistatic_angle_deg: float = 0.0,
+        target_heading_deg: float = 0.0,
+        use_pca: bool = True,
     ):
         self.source_mode = source_mode
         self.port = port
@@ -608,11 +738,17 @@ class MicroDopplerApp:
         self.num_doppler_bins = int(num_doppler_bins)
         self.clim_min = float(clim_min)
         self.clim_max = float(clim_max)
+        self.bistatic_angle_deg = float(bistatic_angle_deg)
+        self.target_heading_deg = float(target_heading_deg)
+        self.use_pca = use_pca
 
         self.running = True
         self.processor = MicroDopplerProcessor(
             single_antenna=self.single_antenna,
-            num_doppler_bins=self.num_doppler_bins
+            num_doppler_bins=self.num_doppler_bins,
+            bistatic_angle_deg=self.bistatic_angle_deg,
+            target_heading_deg=self.target_heading_deg,
+            use_pca=self.use_pca,
         )
 
         # Thread-safe buffer for incoming packets
@@ -960,6 +1096,9 @@ def main():
     parser.add_argument("--clim-min", type=float, default=-40.0, help="Spectrogram colormap min dB (default: -40.0)")
     parser.add_argument("--clim-max", type=float, default=20.0, help="Spectrogram colormap max dB (default: 20.0)")
     parser.add_argument("--single-antenna", action="store_true", help="Fallback to single-antenna processing (Rx0)")
+    parser.add_argument("--bistatic-angle", type=float, default=0.0, help="Bistatic angle beta in degrees (default: 0.0)")
+    parser.add_argument("--target-heading", type=float, default=0.0, help="Target heading angle theta in degrees (default: 0.0)")
+    parser.add_argument("--no-pca", action="store_true", help="Disable PCA subcarrier aggregation and use scalar mean")
 
     args = parser.parse_args()
 
@@ -984,6 +1123,8 @@ def main():
     print(f"  Target FPS:     {args.fps} FPS")
     print(f"  Doppler Bins:   {args.bins}")
     print(f"  Color Range:    [{args.clim_min:.1f}, {args.clim_max:.1f}] dB")
+    print(f"  Bistatic Angle: {args.bistatic_angle:.1f} deg (Heading: {args.target_heading:.1f} deg)")
+    print(f"  PCA Subcarrier: {'Disabled (Mean)' if args.no_pca else 'Enabled (PC1 Extraction)'}")
     print(f"  Blitting:       {'Disabled' if args.no_blit else 'Enabled (Hardware Fast)'}")
     print("  Close plot window to exit.")
     print("=" * 68 + "\n")
@@ -1000,6 +1141,9 @@ def main():
         use_blit=(not args.no_blit),
         clim_min=args.clim_min,
         clim_max=args.clim_max,
+        bistatic_angle_deg=args.bistatic_angle,
+        target_heading_deg=args.target_heading,
+        use_pca=(not args.no_pca),
     )
     app.run()
 
