@@ -57,6 +57,64 @@ def get_router_runner(
     return run_serial
 
 
+def start_remote_extractor(
+    ip: str = DEFAULT_R6800_IP,
+    laptop_ip: str = "192.168.10.102",
+    port: int = 5500,
+    password: str = DEFAULT_ROUTER_PASSWORD,
+) -> bool:
+    """Starts /tmp/csi_extractor quietly in the background via SSH without terminal spam."""
+    try:
+        import paramiko
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(ip, username="root", password=password, timeout=5)
+        client.exec_command("killall csi_extractor 2>/dev/null")
+        time.sleep(0.3)
+        stdin, stdout, stderr = client.exec_command("ls -d /sys/kernel/debug/ieee80211/phy*/mt76/csi_data 2>/dev/null | tail -1")
+        path = stdout.read().decode().strip()
+        if not path:
+            print("[!] Error: No CSI DebugFS nodes found on router.", file=sys.stderr)
+            client.close()
+            return False
+        parts = path.split("/")
+        phy = parts[5] if len(parts) > 5 else "phy5"
+        cmd = f"/tmp/csi_extractor -i {phy} -d {laptop_ip} -p {port} -e > /tmp/csi_extractor.log 2>&1 &"
+        client.exec_command(cmd)
+        time.sleep(0.6)
+        stdin, stdout, stderr = client.exec_command("ps | grep csi_extractor | grep -v grep")
+        ps_out = stdout.read().decode().strip()
+        client.close()
+        if ps_out:
+            print(f"[+] Successfully launched csi_extractor on {phy} -> {laptop_ip}:{port} (quiet background)")
+            return True
+        else:
+            print("[!] Warning: csi_extractor failed to launch. Check /tmp/csi_extractor.log", file=sys.stderr)
+            return False
+    except Exception as e:
+        print(f"[!] SSH error starting extractor: {e}", file=sys.stderr)
+        return False
+
+
+def stop_remote_extractor(
+    ip: str = DEFAULT_R6800_IP,
+    password: str = DEFAULT_ROUTER_PASSWORD,
+) -> bool:
+    """Stops all running csi_extractor and probe loop processes on the router."""
+    try:
+        import paramiko
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(ip, username="root", password=password, timeout=5)
+        client.exec_command("killall csi_extractor 2>/dev/null; killall iw 2>/dev/null")
+        client.close()
+        print("[+] Stopped csi_extractor and probe loops on router.")
+        return True
+    except Exception as e:
+        print(f"[!] Error stopping extractor: {e}", file=sys.stderr)
+        return False
+
+
 class TrafficGenerator:
     """Manages excitation traffic generation for CSI capture."""
 
@@ -208,7 +266,7 @@ class TrafficGenerator:
 
 def main():
     parser = argparse.ArgumentParser(description="Netgear R6200 / R6800 CSI Traffic Generator")
-    parser.add_argument("--mode", choices=["udp", "probe", "stats", "test-udp"], default="stats",
+    parser.add_argument("--mode", choices=["udp", "probe", "stats", "test-udp"], default=None,
                         help="Traffic generation / monitoring mode (default: stats)")
     parser.add_argument("--ip", default=DEFAULT_R6800_IP, help="Target IP address")
     parser.add_argument("--port", type=int, default=5500, help="Target UDP port")
@@ -216,17 +274,30 @@ def main():
     parser.add_argument("--duration", type=float, default=None, help="Duration in seconds (default: infinite)")
     parser.add_argument("--continuous", action="store_true", help="Keep running continuously until Ctrl+C")
     parser.add_argument("--count", type=int, default=10, help="Number of bursts for probe mode (default: 10)")
+    parser.add_argument("--start-extractor", action="store_true", help="Launch /tmp/csi_extractor quietly in background on router")
+    parser.add_argument("--stop-extractor", action="store_true", help="Stop all csi_extractor and probe processes on router")
+    parser.add_argument("--laptop-ip", default="192.168.10.102", help="Laptop IP for extractor streaming (default: 192.168.10.102)")
     parser.add_argument("--use-serial", action="store_true", help="Force serial COM port instead of SSH")
     parser.add_argument("--serial-port", default=DEFAULT_SERIAL_PORT, help="Serial COM port")
     parser.add_argument("--baud", type=int, default=DEFAULT_SERIAL_BAUD, help="Serial baud rate")
     args = parser.parse_args()
 
+    if args.stop_extractor:
+        stop_remote_extractor(ip=args.ip)
+        return
+
+    if args.start_extractor:
+        start_remote_extractor(ip=args.ip, laptop_ip=args.laptop_ip, port=args.port)
+        if args.mode is None:
+            return
+
+    mode = args.mode or "stats"
     gen = TrafficGenerator(target_ip=args.ip, target_port=args.port, rate_hz=args.rate)
     runner = None
-    if args.mode in ("probe", "stats"):
+    if mode in ("probe", "stats"):
         runner = get_router_runner(use_serial=args.use_serial, serial_port=args.serial_port, baud=args.baud, ip=args.ip)
 
-    if args.mode == "test-udp":
+    if mode == "test-udp":
         target = args.ip if args.ip != DEFAULT_R6800_IP else "127.0.0.1"
         print(f"[*] Sending valid 1058-byte CSI packets to {target}:{args.port} at {args.rate:.1f} Hz...")
         gen.target_ip = target
