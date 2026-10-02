@@ -19,6 +19,8 @@ import argparse
 import socket
 import time
 import sys
+import struct
+import numpy as np
 from typing import Optional, Callable
 
 DEFAULT_R6800_IP = "192.168.10.1"
@@ -73,11 +75,61 @@ class TrafficGenerator:
 
         return self.packets_sent
 
+    def generate_csi_test_stream(self, duration_s: Optional[float] = None) -> int:
+        """
+        Transmits valid 1058-byte struct mt76_csi_data UDP packets to verify
+        that csi_doppler_V2.py receives and processes packets.
+        """
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.running = True
+        self.packets_sent = 0
+        start_time = time.time()
+        hdr_format = "<QIH6B4b2B6s2B"
+
+        try:
+            while self.running:
+                now_us = int(time.time() * 1e6)
+                seq = self.packets_sent
+                # Construct 34-byte header
+                hdr = struct.pack(
+                    hdr_format,
+                    now_us, seq, seq % 4096,
+                    1, 0, 36, 4, 1, 64,
+                    -45, -50, -55, -60,
+                    80, 0, b"\x44\xa5\x6e\x70\xe5\x8b", 0, 0
+                )
+                # 512 bytes I + 512 bytes Q
+                t = seq * self.interval
+                sc_amp = 100
+                i_arr = np.zeros((4, 64), dtype="<i2")
+                q_arr = np.zeros((4, 64), dtype="<i2")
+                for a in range(4):
+                    phase = 2 * np.pi * 3.0 * t + (a * np.pi / 2)
+                    i_arr[a, :] = int(sc_amp * np.cos(phase))
+                    q_arr[a, :] = int(sc_amp * np.sin(phase))
+
+                payload = hdr + i_arr.tobytes() + q_arr.tobytes()
+                sock.sendto(payload, (self.target_ip, self.target_port))
+                self.packets_sent += 1
+
+                if duration_s is not None and (time.time() - start_time) >= duration_s:
+                    break
+
+                time.sleep(self.interval)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            sock.close()
+            self.running = False
+
+        return self.packets_sent
+
     def generate_probe_burst(
         self,
         serial_runner: Optional[Callable[[str, float], str]] = None,
         count: int = 5,
         freq_mhz: int = 5180,
+        continuous: bool = False,
     ) -> int:
         """
         Triggers active 802.11 probe scan requests on the specified frequency
@@ -88,11 +140,22 @@ class TrafficGenerator:
             serial_runner = run_serial
 
         probes_sent = 0
-        for _ in range(count):
-            cmd = f"iw dev phy3-ap0 scan freq {freq_mhz} > /dev/null 2>&1"
-            serial_runner(cmd, 1.0)
-            probes_sent += 1
-            time.sleep(0.1)
+        try:
+            while True:
+                cmd = f"iw dev phy3-ap0 scan freq {freq_mhz} > /dev/null 2>&1"
+                try:
+                    serial_runner(cmd, 0.5)
+                except Exception as e:
+                    print(f"[!] Serial error (is PuTTY open on COM11?): {e}", file=sys.stderr)
+                    print("[*] Tip: If PuTTY is open, you can run this command directly in PuTTY:", file=sys.stderr)
+                    print(f"    while true; do {cmd}; sleep 0.1; done &", file=sys.stderr)
+                    break
+                probes_sent += 1
+                if not continuous and probes_sent >= count:
+                    break
+                time.sleep(self.interval)
+        except KeyboardInterrupt:
+            pass
 
         return probes_sent
 
@@ -118,26 +181,35 @@ class TrafficGenerator:
 
 def main():
     parser = argparse.ArgumentParser(description="Netgear R6200 / R6800 CSI Traffic Generator")
-    parser.add_argument("--mode", choices=["udp", "probe", "stats"], default="stats",
+    parser.add_argument("--mode", choices=["udp", "probe", "stats", "test-udp"], default="stats",
                         help="Traffic generation / monitoring mode (default: stats)")
     parser.add_argument("--ip", default=DEFAULT_R6800_IP, help="Target IP address")
     parser.add_argument("--port", type=int, default=5500, help="Target UDP port")
     parser.add_argument("--rate", type=float, default=100.0, help="Packet transmission rate in Hz")
     parser.add_argument("--duration", type=float, default=None, help="Duration in seconds (default: infinite)")
+    parser.add_argument("--continuous", action="store_true", help="Keep running continuously until Ctrl+C")
+    parser.add_argument("--count", type=int, default=10, help="Number of bursts for probe mode (default: 10)")
     parser.add_argument("--serial-port", default=DEFAULT_SERIAL_PORT, help="Serial COM port")
     parser.add_argument("--baud", type=int, default=DEFAULT_SERIAL_BAUD, help="Serial baud rate")
     args = parser.parse_args()
 
     gen = TrafficGenerator(target_ip=args.ip, target_port=args.port, rate_hz=args.rate)
 
-    if args.mode == "udp":
+    if args.mode == "test-udp":
+        target = args.ip if args.ip != DEFAULT_R6800_IP else "127.0.0.1"
+        print(f"[*] Sending valid 1058-byte CSI packets to {target}:{args.port} at {args.rate:.1f} Hz...")
+        gen.target_ip = target
+        sent = gen.generate_csi_test_stream(duration_s=args.duration)
+        print(f"[+] Complete. Sent {sent} test CSI packets.")
+
+    elif args.mode == "udp":
         print(f"[*] Starting UDP traffic generation to {args.ip}:{args.port} at {args.rate:.1f} Hz...")
         sent = gen.generate_udp_stream(duration_s=args.duration)
         print(f"[+] Complete. Sent {sent} packets.")
 
     elif args.mode == "probe":
-        print(f"[*] Triggering 802.11 active probe bursts on 5180 MHz...")
-        sent = gen.generate_probe_burst(count=10)
+        print(f"[*] Triggering 802.11 active probe bursts on 5180 MHz (continuous={args.continuous})...")
+        sent = gen.generate_probe_burst(count=args.count, continuous=args.continuous)
         print(f"[+] Complete. Triggered {sent} probe scan bursts.")
 
     elif args.mode == "stats":
