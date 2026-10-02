@@ -310,31 +310,13 @@ new_fill = '''\t\tmt7615_mac_fill_tm_rx(mphy->priv, rxd);
 \t\t\t\tif (foe_val & BIT(11))
 \t\t\t\t\tfoe_val -= 4096;
 
-\t\t\t\tfor (ant = 0; ant < MT76_CSI_MAX_ANTENNAS; ant++) {
-\t\t\t\t\ts8 ant_rssi = csi_rec->rssi[ant];
-\t\t\t\t\ts32 amp = (ant_rssi > -110 && ant_rssi <= 0) ? (ant_rssi + 110) * 3 : 0;
-\t\t\t\t\ts16 ant_phase_offset = ant * 128;
-
-\t\t\t\t\tfor (sc = 0; sc < MT76_CSI_MAX_SUBCARRIERS; sc++) {
-\t\t\t\t\t\ts32 sc_factor = 256 + ((sc - 32) * (sc - 32) / 4);
-\t\t\t\t\t\ts32 sc_amp = (amp * sc_factor) >> 8;
-\t\t\t\t\t\ts16 phase = (sc * 32 + ant_phase_offset + (foe_val >> 2)) & 0x1ff;
-\t\t\t\t\t\tint q = (phase >> 7) & 3;
-\t\t\t\t\t\tint f = phase & 0x7f;
-\t\t\t\t\t\tint p = (f * (128 - f)) >> 5;
-\t\t\t\t\t\ts16 sin_v, cos_v;
-
-\t\t\t\t\t\tswitch (q) {
-\t\t\t\t\t\tcase 0:  sin_v = p;       cos_v = 128 - p; break;
-\t\t\t\t\t\tcase 1:  sin_v = 128 - p; cos_v = -p;      break;
-\t\t\t\t\t\tcase 2:  sin_v = -p;      cos_v = p - 128; break;
-\t\t\t\t\t\tdefault: sin_v = p - 128; cos_v = p;       break;
-\t\t\t\t\t\t}
-
-\t\t\t\t\t\tcsi_rec->i_data[ant][sc] = (s16)((sc_amp * cos_v) >> 7);
-\t\t\t\t\t\tcsi_rec->q_data[ant][sc] = (s16)((sc_amp * sin_v) >> 7);
-\t\t\t\t\t}
-\t\t\t\t}
+\t\t\t\t/* Hardware RX status vector (Group 3) contains only scalar PHY metrics
+\t\t\t\t * (RSSI, RCPI, FOE, Noise Floor). Synthetic sine/cosine pseudo-CSI has been
+\t\t\t\t * eliminated for 100% technical honesty. Subcarrier I/Q buffers are zeroed;
+\t\t\t\t * physical CFR matrices are extracted from IEEE 802.11ac VHT Compressed
+\t\t\t\t * Beamforming Reports (BFR) via laptop/vht_bfr_decompressor.py. */
+\t\t\t\tmemset(csi_rec->i_data, 0, sizeof(csi_rec->i_data));
+\t\t\t\tmemset(csi_rec->q_data, 0, sizeof(csi_rec->q_data));
 
 \t\t\t\tmt76_csi_buf_write_end(dev->mt76.csi_buf);
 \t\t\t}

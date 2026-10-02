@@ -129,7 +129,7 @@ The modification strategy separates general ring-buffer and data structures (whi
     - `RXV4`: RCPI per chain (Ant 0..3).
     - `RXV5`: FOE (Frequency Offset Estimation, 12-bit signed scalar) and timing.
     - `RXV6`: Noise floor per chain (NF 0..3).
-  * **Synthetic Pseudo-CSI Scaffolding:** Neither Group 3 RXV nor `mt7615_mac_fill_tm_rx()` provides baseband channel frequency response (CFR) matrices. The sine/cosine I/Q synthesis in `902` derives 64 subcarriers from scalar FOE and RCPI. While invaluable for testing the DMA ring-buffer, waitqueue, userspace daemon, and laptop UDP pipeline end-to-end, it does not reflect multipath fading.
+  * **Elimination of Synthetic Pseudo-CSI:** Neither Group 3 RXV nor `mt7615_mac_fill_tm_rx()` provides baseband channel frequency response (CFR) matrices. The sine/cosine I/Q synthesis has been completely audited and removed from `patches/902-csi-mt7615-rx-capture.patch` and `build/generate_csi_patches.py`. Subcarrier I/Q buffers are explicitly zeroed to prevent false claims of multipath sensing from scalar metadata.
   * **Real Physical CSI Path:** Physical baseband channel matrices on MT7615 hardware are obtained via IEEE 802.11ac VHT Compressed Beamforming Reports (BFR) action frames (`Category 127: VHT Action`, `Action 0`), where the baseband DSP computes Givens rotation angles ($\psi, \phi$) and SNR per subcarrier. Reconstructing true CFR matrices $H(k)$ from these frames is handled via `vht_bfr_decompressor.py`.
 
 ### 3.4 `903-csi-mt7615-debugfs-init.patch`

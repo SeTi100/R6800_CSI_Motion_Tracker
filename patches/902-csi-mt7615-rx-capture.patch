@@ -81,31 +81,13 @@
 +				if (foe_val & BIT(11))
 +					foe_val -= 4096;
 +
-+				for (ant = 0; ant < MT76_CSI_MAX_ANTENNAS; ant++) {
-+					s8 ant_rssi = csi_rec->rssi[ant];
-+					s32 amp = (ant_rssi > -110 && ant_rssi <= 0) ? (ant_rssi + 110) * 3 : 0;
-+					s16 ant_phase_offset = ant * 128;
-+
-+					for (sc = 0; sc < MT76_CSI_MAX_SUBCARRIERS; sc++) {
-+						s32 sc_factor = 256 + ((sc - 32) * (sc - 32) / 4);
-+						s32 sc_amp = (amp * sc_factor) >> 8;
-+						s16 phase = (sc * 32 + ant_phase_offset + (foe_val >> 2)) & 0x1ff;
-+						int q = (phase >> 7) & 3;
-+						int f = phase & 0x7f;
-+						int p = (f * (128 - f)) >> 5;
-+						s16 sin_v, cos_v;
-+
-+						switch (q) {
-+						case 0:  sin_v = p;       cos_v = 128 - p; break;
-+						case 1:  sin_v = 128 - p; cos_v = -p;      break;
-+						case 2:  sin_v = -p;      cos_v = p - 128; break;
-+						default: sin_v = p - 128; cos_v = p;       break;
-+						}
-+
-+						csi_rec->i_data[ant][sc] = (s16)((sc_amp * cos_v) >> 7);
-+						csi_rec->q_data[ant][sc] = (s16)((sc_amp * sin_v) >> 7);
-+					}
-+				}
++				/* Hardware RX status vector (Group 3) contains only scalar PHY metrics
++				 * (RSSI, RCPI, FOE, Noise Floor). Synthetic sine/cosine pseudo-CSI has been
++				 * eliminated for 100% technical honesty. Subcarrier I/Q buffers are zeroed;
++				 * physical CFR matrices are extracted from IEEE 802.11ac VHT Compressed
++				 * Beamforming Reports (BFR) via laptop/vht_bfr_decompressor.py. */
++				memset(csi_rec->i_data, 0, sizeof(csi_rec->i_data));
++				memset(csi_rec->q_data, 0, sizeof(csi_rec->q_data));
 +
 +				mt76_csi_buf_write_end(dev->mt76.csi_buf);
 +			}

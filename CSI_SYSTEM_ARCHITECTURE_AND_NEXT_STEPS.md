@@ -301,13 +301,16 @@ Logarithmic Power Spectrum (dB), Velocity grid mapped via bistatic wavelength
 
 ### Phase C: Physical CFR Extraction on MT7615 (AUDITED & IMPLEMENTED)
 1. **Driver & Hardware Audit Verdict:**
-   * Group 3 RX Vectors (`rxd[0..5]`) provide only scalar metrics (FOE, RCPI, RSSI, NF). The sine/cosine formula in patch 902 is synthetic pseudo-CSI scaffolding.
+   * Group 3 RX Vectors (`rxd[0..5]`) provide only scalar metrics (FOE, RCPI, RSSI, NF). Synthetic sine/cosine pseudo-CSI in `patches/902-csi-mt7615-rx-capture.patch` and `build/generate_csi_patches.py` has been completely eliminated for 100% honesty; subcarrier buffers are zeroed unless genuine CFR is present.
    * Opcode `MCU_EXT_CMD_CSI_CTRL = 0xc2` is an MT7915 Wi-Fi 6 command and is invalid on MT7615 Andes N9 firmware.
    * ATE Testmode (`mt7615_mac_fill_tm_rx` / `MT_WF_PHY_RFINTF3`) is for factory RF calibration, not subcarrier baseband dumping.
 2. **IEEE 802.11ac VHT Compressed Beamforming Report (BFR) Decompressor:**
    * Fully implemented in [`laptop/vht_bfr_decompressor.py`](file:///C:/Users/timkl/Desktop/Coding/R6800_CSI_Motion_Tracker/laptop/vht_bfr_decompressor.py).
-   * Unpacks MIMO Control field, decodes Givens rotation angles ($\psi, \phi$) for $N_r \times N_c$ antenna dimensions, computes Givens unitary matrix $V(k)$, and scales by average SNR to recover true baseband CFR matrix $H(k) = V(k) \sqrt{\text{SNR}_k}$.
-   * Validated in automated test suite (`laptop/test_pipeline.py`, tests 26-29).
+   * Unpacks MIMO Control field (including First/Remaining segments and MU feedback), decodes Givens rotation angles ($\psi, \phi$) with unitary transformation $U = D \cdot G$, reconstructs complex steering matrix $V(k)$ preserving phase rotations, and scales by average SNR to recover true baseband CFR matrix $H(k) = V(k) \sqrt{\text{SNR}_k}$.
+   * Features `VHTBFRReassembler` for multi-frame fragmented beamforming action frame reconstruction.
+   * Validated in automated test suite (`laptop/test_pipeline.py`, tests 26-31).
+3. **Traffic Excitation Utility:**
+   * Implemented in [`traffic_generator.py`](file:///C:/Users/timkl/Desktop/Coding/R6800_CSI_Motion_Tracker/traffic_generator.py) to provide continuous excitation (UDP streaming, 802.11 active probe bursts, and real-time packet rate monitoring) for the stock Netgear R6200 transmitter.
 
 ---
 
@@ -336,9 +339,14 @@ echo 44:a5:6e:70:e5:8b > /sys/kernel/debug/ieee80211/phy3/mt76/csi_filter_mac
 # Authenticated serial command runner
 python serial_cmd.py "cat /sys/kernel/debug/ieee80211/phy3/mt76/csi_stats"
 
+# Run Traffic Generator / Monitor
+python traffic_generator.py --mode stats
+python traffic_generator.py --mode probe --rate 50.0
+
 # Run Test Suite
 python -m unittest discover -s laptop
 
 # Run Doppler Processing Dashboard
 python laptop/csi_doppler.py --port 5500 --bistatic-angle 60.0 --target-heading 0.0
 ```
+

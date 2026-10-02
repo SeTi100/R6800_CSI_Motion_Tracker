@@ -890,6 +890,10 @@ class TestCSIPipeline(unittest.TestCase):
         # Column norm must be 1.0 (orthonormal steering vector)
         norm = np.linalg.norm(V_2x1[:, 0])
         self.assertAlmostEqual(norm, 1.0, places=6)
+        # Check that Givens rotation preserves complex phase phi in element 1
+        expected_imag = math.sin(psi_angles[0]) * math.sin(phi_angles[0])
+        self.assertAlmostEqual(V_2x1[1, 0].imag, expected_imag, places=6)
+        self.assertGreater(abs(V_2x1[1, 0].imag), 0.1)
 
         # 3. Test 4x2 MIMO Givens reconstruction (unitary columns)
         # For Nr=4, Nc=2: sum_{i=0..1}(4 - 1 - i) = (3) + (2) = 5 angle pairs
@@ -927,7 +931,117 @@ class TestCSIPipeline(unittest.TestCase):
         expected_scale = math.sqrt(10.0 ** (30.0 / 10.0))
         self.assertAlmostEqual(np.linalg.norm(H_first), expected_scale, delta=1.5)
 
+    def test_30_vht_bfr_reassembler_and_mu_mimo(self):
+        """Verify multi-segment BFR fragmentation, reassembly, and MU-MIMO feedback."""
+        from vht_bfr_decompressor import (
+            get_vht_subcarriers,
+            construct_givens_matrix,
+            encode_vht_bfr,
+            decompress_vht_bfr,
+            VHTBFRReassembler,
+        )
+
+        # 1. Test MU-MIMO 4x3 Givens reconstruction (Nc > 2, codebook_info = 1)
+        # Nr=4, Nc=3: sum_{i=0..2}(4 - 1 - i) = (3) + (2) + (1) = 6 angle pairs
+        phi_6 = [0.1, 0.3, 0.5, 0.7, 0.9, 1.1]
+        psi_6 = [0.2, 0.4, 0.6, 0.8, 1.0, 1.2]
+        V_4x3 = construct_givens_matrix(n_r=4, n_c=3, phi_angles=phi_6, psi_angles=psi_6)
+        self.assertEqual(V_4x3.shape, (4, 3))
+        vh_v = V_4x3.conj().T @ V_4x3
+        self.assertTrue(np.allclose(vh_v, np.eye(3), atol=1e-5))
+        # Ensure imaginary parts are preserved across all columns
+        self.assertTrue(np.any(np.abs(V_4x3.imag) > 0.05))
+
+        # 2. Test multi-segment fragmentation and reassembly
+        tones_20m = get_vht_subcarriers(channel_width=0, grouping=0)
+        angles_map = {}
+        for tone in tones_20m:
+            angles_map[int(tone)] = ([math.pi / 4.0], [math.pi / 3.0])
+
+        full_bfr = encode_vht_bfr(
+            n_c=1, n_r=2, channel_width=0, grouping=0, codebook_info=0,
+            dialog_token=12, avg_snr=[25.0], angles_per_subcarrier=angles_map,
+            include_action_header=True
+        )
+
+        # Split payload across 2 segments:
+        # Header (Action + MIMO ctrl) is 5 bytes. Data is full_bfr[5:]
+        data_body = full_bfr[5:]
+        half = len(data_body) // 2
+        chunk1 = data_body[:half]
+        chunk2 = data_body[half:]
+
+        # Seg 1: first_segment=1, remaining_segments=1
+        seg1 = encode_vht_bfr(
+            n_c=1, n_r=2, channel_width=0, grouping=0, codebook_info=0,
+            dialog_token=12, avg_snr=[], angles_per_subcarrier={},
+            include_action_header=True, first_segment=1, remaining_segments=1
+        )[:5] + chunk1
+
+        # Seg 2: first_segment=0, remaining_segments=0
+        seg2 = encode_vht_bfr(
+            n_c=1, n_r=2, channel_width=0, grouping=0, codebook_info=0,
+            dialog_token=12, avg_snr=[], angles_per_subcarrier={},
+            include_action_header=True, first_segment=0, remaining_segments=0
+        )[:5] + chunk2
+
+        reassembler = VHTBFRReassembler()
+        rep1 = reassembler.process_frame(seg1)
+        self.assertIsNone(rep1)  # Incomplete
+
+        rep2 = reassembler.process_frame(seg2)
+        self.assertIsNotNone(rep2)  # Reassembled!
+        self.assertEqual(rep2.dialog_token, 12)
+        self.assertEqual(rep2.n_c, 1)
+        self.assertEqual(rep2.n_r, 2)
+        H_tone = rep2.get_channel_matrix(int(tones_20m[0]))
+        self.assertIsNotNone(H_tone)
+
+    def test_31_traffic_generator(self):
+        """Verify traffic generator UDP stream, probe burst mock, and CSI stats parsing."""
+        import sys
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+        from traffic_generator import TrafficGenerator
+
+        # 1. Test stats parsing
+        sample_stats = """
+        capture_active: 1
+        mode:           1
+        total_captured: 105481
+        total_dropped:  103853
+        overflow_count: 103853
+        buf_head:       105481
+        buf_tail:       105225
+        buf_used:       256 / 256
+        filter_enabled: 1
+        filter_mac:     44:a5:6e:70:e5:8b
+        """
+        stats = TrafficGenerator.parse_csi_stats(sample_stats)
+        self.assertEqual(stats["capture_active"], 1)
+        self.assertEqual(stats["total_captured"], 105481)
+        self.assertEqual(stats["buf_used"], 256)
+        self.assertEqual(stats["filter_mac"], "44:a5:6e:70:e5:8b")
+
+        # 2. Test UDP stream generation with short duration
+        gen = TrafficGenerator(target_ip="127.0.0.1", target_port=55999, rate_hz=200.0)
+        sent = gen.generate_udp_stream(duration_s=0.03, payload_size=32)
+        self.assertGreater(sent, 0)
+        self.assertEqual(gen.running, False)
+
+        # 3. Test probe burst excitation with mock serial runner
+        commands_run = []
+        def mock_serial(cmd, wait):
+            commands_run.append(cmd)
+            return "OK"
+
+        probes_sent = gen.generate_probe_burst(serial_runner=mock_serial, count=3, freq_mhz=5180)
+        self.assertEqual(probes_sent, 3)
+        self.assertEqual(len(commands_run), 3)
+        self.assertIn("5180", commands_run[0])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
 

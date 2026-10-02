@@ -114,38 +114,38 @@ def construct_givens_matrix(
     Reconstructs the N_r x N_c orthonormal beamforming steering matrix V
     from Givens rotation angles phi and psi according to IEEE 802.11ac Section 19.3.12.3.
 
-    V = [prod_{i=1}^{Nc} D_i(phi) prod_{l=i+1}^{Nr} G_{l,i}(psi)] * I_{Nr x Nc}
+    V = [prod_{i=1}^{min(Nc, Nr-1)} [ D_i(phi) prod_{l=i+1}^{Nr} G_{l,i}(psi)^T ]] * I_{Nr x Nc}
     """
     V = np.eye(n_r, dtype=np.complex128)
 
     angle_idx = 0
-    for i in range(n_c):
-        # Apply Givens rotations G_{l,i}(psi_{l,i}) and phase rotations D_i(phi_{l,i})
+    for i in range(min(n_c, n_r - 1)):
         for l in range(i + 1, n_r):
             phi = phi_angles[angle_idx] if angle_idx < len(phi_angles) else 0.0
             psi = psi_angles[angle_idx] if angle_idx < len(psi_angles) else 0.0
             angle_idx += 1
 
-            # Givens rotation in plane (i, l)
             c = math.cos(psi)
             s = math.sin(psi)
 
-            # Rotation matrix G operating on rows i and l
+            # Rotation matrix G in plane (i, l)
             G = np.eye(n_r, dtype=np.complex128)
             G[i, i] = c
-            G[i, l] = s
-            G[l, i] = -s
+            G[i, l] = -s
+            G[l, i] = s
             G[l, l] = c
 
-            # Phase matrix D on column i
+            # Diagonal phase matrix D on index l
             D = np.eye(n_r, dtype=np.complex128)
             D[l, l] = np.exp(1j * phi)
 
-            # Accumulate rotation V = V @ G.T @ D
-            V = V @ G.T @ D
+            # Apply unitary transformation: U = D @ G
+            U = D @ G
+            V = V @ U
 
     # Extract first N_c columns
     return V[:, :n_c]
+
 
 
 class VHTBeamformingReport:
@@ -163,6 +163,9 @@ class VHTBeamformingReport:
         subcarrier_indices: np.ndarray,
         v_matrices: Dict[int, np.ndarray],
         snr_per_subcarrier: Optional[Dict[int, np.ndarray]] = None,
+        feedback_type: int = 0,
+        remaining_segments: int = 0,
+        first_segment: int = 1,
     ):
         self.n_c = n_c
         self.n_r = n_r
@@ -174,6 +177,9 @@ class VHTBeamformingReport:
         self.subcarrier_indices = subcarrier_indices
         self.v_matrices = v_matrices  # map: subcarrier_k -> V (N_r x N_c) complex matrix
         self.snr_per_subcarrier = snr_per_subcarrier or {}
+        self.feedback_type = feedback_type
+        self.remaining_segments = remaining_segments
+        self.first_segment = first_segment
 
     def get_channel_matrix(self, subcarrier_k: int) -> Optional[np.ndarray]:
         """
@@ -201,6 +207,17 @@ def decompress_vht_bfr(payload: bytes) -> VHTBeamformingReport:
         raise ValueError("Payload too short for VHT MIMO Control Field (min 3 bytes required)")
 
     # 1. Parse VHT MIMO Control Field (3 bytes / 24 bits)
+    # IEEE Std 802.11ac-2013 Table 8-197e:
+    #   B0-B2:  Nc Index (0 to 7 -> 1 to 8)
+    #   B3-B5:  Nr Index (0 to 7 -> 1 to 8)
+    #   B6-B7:  Channel Width (0=20MHz, 1=40MHz, 2=80MHz, 3=160MHz)
+    #   B8:     Grouping (0=Ng 1, 1=Ng 2 or 4)
+    #   B9:     Codebook Information (0=SU, 1=MU)
+    #   B10:    Feedback Type (0=SU, 1=MU)
+    #   B11-13: Remaining Feedback Segments (0=last)
+    #   B14:    First Feedback Segment (1=first)
+    #   B15-17: Reserved
+    #   B18-23: Sounding Dialog Token Number (6 bits)
     ctrl_bytes = payload[offset:offset + 3]
     ctrl_val = struct.unpack("<I", ctrl_bytes + b"\x00")[0] & 0xFFFFFF
     offset += 3
@@ -210,13 +227,15 @@ def decompress_vht_bfr(payload: bytes) -> VHTBeamformingReport:
     chan_width = (ctrl_val >> 6) & 0x3
     grouping = (ctrl_val >> 8) & 0x1
     codebook_info = (ctrl_val >> 9) & 0x1
-    dialog_token = (ctrl_val >> 12) & 0xF
+    feedback_type = (ctrl_val >> 10) & 0x1
+    remaining_segments = (ctrl_val >> 11) & 0x7
+    first_segment = (ctrl_val >> 14) & 0x1
+    dialog_token = (ctrl_val >> 18) & 0x3F
 
     b_psi, b_phi = get_codebook_bits(codebook_info)
 
-    # Number of Givens angles per subcarrier: (2 * N_r - 1) * N_c - N_c^2 in general
-    # For each column i: (N_r - 1 - i) pairs of (phi, psi)
-    n_angles = sum(n_r - 1 - i for i in range(n_c))
+    # Number of Givens angles per subcarrier
+    n_angles = sum(n_r - 1 - i for i in range(min(n_c, n_r - 1)))
 
     # 2. Parse Average SNR per spatial stream (1 byte each)
     if len(payload) - offset < n_c:
@@ -260,6 +279,9 @@ def decompress_vht_bfr(payload: bytes) -> VHTBeamformingReport:
         avg_snr=avg_snr,
         subcarrier_indices=tones,
         v_matrices=v_matrices,
+        feedback_type=feedback_type,
+        remaining_segments=remaining_segments,
+        first_segment=first_segment,
     )
 
 
@@ -272,7 +294,10 @@ def encode_vht_bfr(
     dialog_token: int,
     avg_snr: List[float],
     angles_per_subcarrier: Dict[int, Tuple[List[float], List[float]]],
-    include_action_header: bool = True
+    include_action_header: bool = True,
+    feedback_type: int = 0,
+    remaining_segments: int = 0,
+    first_segment: int = 1,
 ) -> bytes:
     """
     Synthesizes a compliant IEEE 802.11ac VHT Compressed Beamforming Report payload.
@@ -287,7 +312,10 @@ def encode_vht_bfr(
     ctrl_val |= ((channel_width & 0x3) << 6)
     ctrl_val |= ((grouping & 0x1) << 8)
     ctrl_val |= ((codebook_info & 0x1) << 9)
-    ctrl_val |= ((dialog_token & 0xF) << 12)
+    ctrl_val |= ((feedback_type & 0x1) << 10)
+    ctrl_val |= ((remaining_segments & 0x7) << 11)
+    ctrl_val |= ((first_segment & 0x1) << 14)
+    ctrl_val |= ((dialog_token & 0x3F) << 18)
 
     out.extend(struct.pack("<I", ctrl_val)[:3])
 
@@ -314,3 +342,58 @@ def encode_vht_bfr(
 
     out.extend(writer.get_bytes())
     return bytes(out)
+
+
+class VHTBFRReassembler:
+    """
+    Reassembles multi-segment IEEE 802.11ac VHT Compressed Beamforming Action frames.
+    When a BFR exceeds the Maximum Transmission Unit (MTU), it is segmented into multiple
+    frames with remaining_segments counting down to 0.
+    """
+
+    def __init__(self):
+        self._buffers: Dict[int, Dict] = {}
+
+    def process_frame(self, payload: bytes) -> Optional[VHTBeamformingReport]:
+        offset = 0
+        if len(payload) >= 2 and payload[0] == 127 and payload[1] == 0:
+            offset = 2
+        if len(payload) - offset < 3:
+            return None
+
+        ctrl_bytes = payload[offset:offset + 3]
+        ctrl_val = struct.unpack("<I", ctrl_bytes + b"\x00")[0] & 0xFFFFFF
+        first_segment = (ctrl_val >> 14) & 0x1
+        remaining_segments = (ctrl_val >> 11) & 0x7
+        dialog_token = (ctrl_val >> 18) & 0x3F
+
+        # If unsegmented single frame, decode directly
+        if first_segment == 1 and remaining_segments == 0:
+            return decompress_vht_bfr(payload)
+
+        # Segmented frame handling
+        if first_segment == 1:
+            self._buffers[dialog_token] = {
+                'ctrl_bytes': ctrl_bytes,
+                'total_expected': remaining_segments + 1,
+                'segments': {remaining_segments: payload[offset + 3:]},
+            }
+        elif dialog_token in self._buffers:
+            self._buffers[dialog_token]['segments'][remaining_segments] = payload[offset + 3:]
+
+        # Check if all segments received
+        if dialog_token in self._buffers:
+            buf_info = self._buffers[dialog_token]
+            if len(buf_info['segments']) == buf_info['total_expected']:
+                # Reassemble in order (remaining_segments descending: N-1 down to 0)
+                reassembled = bytearray()
+                if offset == 2:
+                    reassembled.extend(bytes([127, 0]))
+                reassembled.extend(buf_info['ctrl_bytes'])
+                for seg_idx in sorted(buf_info['segments'].keys(), reverse=True):
+                    reassembled.extend(buf_info['segments'][seg_idx])
+                del self._buffers[dialog_token]
+                return decompress_vht_bfr(bytes(reassembled))
+
+        return None
+
