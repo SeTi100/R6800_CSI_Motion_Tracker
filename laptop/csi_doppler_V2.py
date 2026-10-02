@@ -32,14 +32,15 @@ from matplotlib.gridspec import GridSpec
 
 # Try importing csi_receiver module from same directory
 try:
-    from laptop.csi_receiver import CSIStreamReceiver, CSIPacket, parse_csi_packet, CSI_PAYLOAD_SIZE
+    from laptop.csi_receiver import CSIStreamReceiver, CSIPacket, parse_csi_packet, CSI_PAYLOAD_SIZE, CSIDataLogger
 except ImportError:
     try:
-        from csi_receiver import CSIStreamReceiver, CSIPacket, parse_csi_packet, CSI_PAYLOAD_SIZE
+        from csi_receiver import CSIStreamReceiver, CSIPacket, parse_csi_packet, CSI_PAYLOAD_SIZE, CSIDataLogger
     except ImportError:
         CSIStreamReceiver = None
         CSIPacket = None
         parse_csi_packet = None
+        CSIDataLogger = None
         CSI_PAYLOAD_SIZE = 1058
 
 
@@ -726,6 +727,7 @@ class MicroDopplerApp:
         bistatic_angle_deg: float = 0.0,
         target_heading_deg: float = 0.0,
         use_pca: bool = True,
+        record_file: Optional[str] = None,
     ):
         self.source_mode = source_mode
         self.port = port
@@ -741,6 +743,8 @@ class MicroDopplerApp:
         self.bistatic_angle_deg = float(bistatic_angle_deg)
         self.target_heading_deg = float(target_heading_deg)
         self.use_pca = use_pca
+        self.record_file = record_file
+        self.logger = CSIDataLogger(filename=record_file) if record_file and CSIDataLogger else None
 
         self.running = True
         self.processor = MicroDopplerProcessor(
@@ -810,6 +814,8 @@ class MicroDopplerApp:
                 pkt = file_reader.get_next_packet()
 
             if pkt is not None:
+                if self.logger:
+                    self.logger.append(pkt)
                 pkt_t_s = (pkt.timestamp_us / 1e6) if pkt.timestamp_us > 0 else time.monotonic()
                 self.processor.add_frame(pkt.csi_complex, pkt_t_s, band=pkt.band)
                 self.latest_packet = pkt
@@ -1076,6 +1082,8 @@ class MicroDopplerApp:
             self.running = False
             if self.worker_thread.is_alive():
                 self.worker_thread.join(timeout=1.0)
+            if self.logger and self.logger.count() > 0:
+                self.logger.save()
 
 
 def main():
@@ -1089,6 +1097,7 @@ def main():
 
     parser.add_argument("--port", "-p", type=int, default=5500, help="UDP port (default: 5500)")
     parser.add_argument("--bind", default="0.0.0.0", help="UDP bind IP (default: 0.0.0.0)")
+    parser.add_argument("--record", "-r", help="Record incoming CSI packets to .npz file (e.g. baseline_still.npz)")
     parser.add_argument("--speed", type=float, default=1.0, help="File playback speed multiplier (default: 1.0)")
     parser.add_argument("--fps", type=int, default=30, help="Target UI refresh rate in FPS (default: 30)")
     parser.add_argument("--bins", type=int, default=129, help="Number of Doppler frequency bins (default: 129)")
@@ -1118,6 +1127,8 @@ def main():
         print(f"  Playback File:  {args.file} (speed: {args.speed}x)")
     elif mode == "mock":
         print("  Simulation:     Human walking & arm swing (+/- 1.4 m/s Doppler)")
+    if args.record:
+        print(f"  Recording To:   {args.record}")
     if args.single_antenna:
         print("  Antenna Mode:   Single-antenna fallback (Rx0)")
     print(f"  Target FPS:     {args.fps} FPS")
@@ -1144,6 +1155,7 @@ def main():
         bistatic_angle_deg=args.bistatic_angle,
         target_heading_deg=args.target_heading,
         use_pca=(not args.no_pca),
+        record_file=args.record,
     )
     app.run()
 
